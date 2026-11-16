@@ -291,8 +291,13 @@ fun InkwellNavDisplay() {
                 SourceDetailScreen(
                     sourceId = route.sourceId,
                     onBack = { nav.back() },
+                    onLogin = { nav.go(SourceLoginRoute(route.sourceId)) },
                     viewModel = vm,
                 )
+            }
+            entry<SourceLoginRoute> {
+                val vm = koinViewModel<com.radium.inkwell.ui.sourceauth.SourceLoginViewModel> { parametersOf(it.sourceId) }
+                com.radium.inkwell.ui.sourceauth.SourceLoginScreen(onBack = { nav.back() }, viewModel = vm)
             }
             entry<SettingsRoute>(
                 metadata = ListDetailSceneStrategy.listPane(

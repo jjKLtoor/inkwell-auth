@@ -49,6 +49,7 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 fun SourceDetailScreen(
     sourceId: String,
     onBack: () -> Unit,
+    onLogin: () -> Unit,
     viewModel: SourceDetailViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -99,6 +100,12 @@ fun SourceDetailScreen(
                 .verticalScroll(rememberScrollState(), overscrollEffect = null)
                 .padding(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding()),
         ) {
+            SectionHeader("来源登录")
+            SettingGroup {
+                SettingBlock {
+                    SecondaryButton(text = "登录与会话", onClick = onLogin, modifier = Modifier.fillMaxWidth())
+                }
+            }
             // 控件装进卡里（设置类页面的骨架）：输入框的底是卡上的那一档，直接铺在灰底上几乎看不出框
             SectionHeader("全链路测试")
             SettingGroup {

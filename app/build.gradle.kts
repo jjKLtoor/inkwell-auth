@@ -112,6 +112,8 @@ composeCompiler {
 }
 
 dependencies {
+    implementation(project(":source-auth"))
+    implementation(libs.androidx.webkit)
     implementation(project(":core"))
     implementation(project(":reader"))
 

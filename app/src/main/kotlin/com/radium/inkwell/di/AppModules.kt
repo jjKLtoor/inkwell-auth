@@ -180,6 +180,13 @@ val appModule = module {
     single { com.radium.inkwell.data.repo.OfflineDownloader(get(), get(), get(), get(), get()) }
     viewModel { SourceManageViewModel(androidContext(), get(), get(), get()) }
     viewModel { (sourceId: String) -> SourceDetailViewModel(sourceId, get(), get(), get()) }
+    single {
+        com.radium.inkwell.sourceauth.EncryptedSessionStore(
+            java.io.File(androidContext().noBackupFilesDir, "source-auth"),
+            com.radium.inkwell.sourceauth.KeystoreSessionCipher(),
+        )
+    }
+    viewModel { (sourceId: String) -> com.radium.inkwell.ui.sourceauth.SourceLoginViewModel(sourceId, get(), get()) }
     viewModel { com.radium.inkwell.ui.sourcewizard.SourceWizardViewModel(get(), get(), get(), get()) }
     viewModel { WebDavViewModel(get(), get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.feedback.FeedbackViewModel(androidContext(), get(), get()) }
