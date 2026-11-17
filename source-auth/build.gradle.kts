@@ -24,10 +24,12 @@ kotlin {
 
 dependencies {
     implementation(project(":core"))
+    implementation(libs.rhino)
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.webkit)
 
+    testImplementation(libs.kotlinx.serialization.json)
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)

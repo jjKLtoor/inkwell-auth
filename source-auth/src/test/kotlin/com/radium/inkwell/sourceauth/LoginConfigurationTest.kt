@@ -12,7 +12,7 @@ class LoginConfigurationTest {
 
     @Test
     fun `未配置登录不影响普通来源`() {
-        listOf(null, "", "  ").forEach { assertEquals(LoginConfiguration.NotConfigured, resolve(it)) }
+        listOf(null, "", "  ").forEach { assertEquals(true, assertIs<LoginConfiguration.WebPage>(resolve(it)).home) }
     }
 
     @Test
@@ -36,18 +36,16 @@ class LoginConfigurationTest {
     }
 
     @Test
-    fun `自定义表单不被网页配置覆盖`() {
-        assertEquals(
-            LoginConfiguration.Unsupported(LoginConfiguration.Reason.CUSTOM_UI),
-            resolve("https://example.com/login", "[]"),
-        )
+    fun `有明确网页的表单标为部分支持而不执行表单`() {
+        val page = assertIs<LoginConfiguration.WebPage>(resolve("https://example.com/login", "[]"))
+        assertEquals(true, page.partial)
+        assertIs<LoginConfiguration.Unsupported>(resolve(null, "[{name: 'password'}]"))
     }
 
     @Test
-    fun `危险协议跨站端口用户信息及私网被拒绝`() {
-        listOf("http://example.com/login", "file:///tmp/login", "intent://login", "data:text/html,login",
-            "https://user:pass@example.com/", "//evil.test/login", "https://example.com.evil.test/",
-            "https://sub.example.com/login", "https://example.com:444/login", "/a\\login",
+    fun `危险协议用户信息及私网被拒绝`() {
+        listOf("file:///tmp/login", "intent://login", "data:text/html,login",
+            "https://user:pass@example.com/", "/a\\login",
             "/login page", "https:example.com/login", "https://127.0.0.1/", "https://[::1]/").forEach {
             assertIs<LoginConfiguration.Unsupported>(resolve(it), it)
         }

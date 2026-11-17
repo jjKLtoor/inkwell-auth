@@ -20,6 +20,82 @@ import kotlin.test.*
 class AuthenticatedEngineTest {
     @get:Rule val temp = TemporaryFolder()
 
+    @Test fun v2旧会话仍可读取并按v3保存且不删除其他文件() = runBlocking {
+        val key = KeyGenerator.getInstance("AES").generateKey()
+        val cipher = AesGcmSessionCipher { key }
+        val root = temp.newFolder()
+        val scope = requireNotNull(SourceAuthScope.create("legacy-fixture", "https://example.com/"))
+        val binding = java.security.MessageDigest.getInstance("SHA-256").digest((scope.sourceId + "\u0000" + scope.originUrl).toByteArray())
+        val cookie = requireNotNull(Cookie.parse("https://example.com/".toHttpUrl(), "sid=legacy; Secure; HttpOnly; Path=/; Max-Age=3600"))
+        val bytes = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(bytes).use { out ->
+            out.writeInt(2); out.writeInt(1); out.writeUTF(cookie.toString()); out.writeInt(0)
+        }
+        java.io.File(root, binding.joinToString("") { "%02x".format(it) } + ".auth").writeBytes(cipher.encrypt(bytes.toByteArray(), binding))
+        val other = java.io.File(root, "unrelated-data").apply { writeText("keep") }
+        val store = EncryptedSessionStore(root, cipher)
+        val restored = requireNotNull(store.load(scope))
+        assertEquals("legacy", restored.cookies.single().value)
+        store.save(scope, restored)
+        assertEquals("legacy", requireNotNull(store.load(scope)).cookies.single().value)
+        assertEquals("keep", other.readText())
+    }
+
+    @Test fun 脚本裸域名Cookie调用仅补全当前获准的HTTPS站点() = runBlocking {
+        val key = KeyGenerator.getInstance("AES").generateKey()
+        val store = EncryptedSessionStore(temp.newFolder(), AesGcmSessionCipher { key })
+        val scope = requireNotNull(SourceAuthScope.create("fixture", "https://example.com/"))
+        val sessions = PersistentSourceSessions(store)
+        val cookie = Cookie.Builder().name("sid").value("fixture").hostOnlyDomain("example.com").path("/").secure().build()
+        val session = sessions.open(scope)
+        session.saveFromResponse("https://example.com/".toHttpUrl(), listOf(cookie))
+        withContext(SourceRequestSession.binding(session)) {
+            val bridge = com.radium.inkwell.core.source.js.CookieBridge(com.radium.inkwell.core.source.js.EngineJsHttp(SourceHttpClient()))
+            assertEquals("fixture", bridge.getKey("example.com", "sid"))
+            assertEquals("", bridge.getCookie("outside.test"))
+            bridge.removeCookie("outside.test")
+            assertEquals("fixture", bridge.getKey("example.com", "sid"))
+        }
+    }
+
+    @Test fun 双站点Cookie恢复保留hostOnly且Header只发原站点() = runBlocking {
+        val key = KeyGenerator.getInstance("AES").generateKey()
+        val store = EncryptedSessionStore(temp.newFolder(), AesGcmSessionCipher { key })
+        val scope = requireNotNull(SourceAuthScope.create("fixture", "https://reader.example.com/", listOf("https://login.example.com/")))
+        val cookie = Cookie.Builder().name("login").value("fixture").hostOnlyDomain("login.example.com")
+            .path("/").secure().httpOnly().expiresAt(System.currentTimeMillis() + 3600000).build()
+        store.save(scope, CookieSession(listOf(cookie)))
+        val restored = requireNotNull(store.load(scope)).cookies.single()
+        assertEquals("login.example.com", restored.domain)
+        assertTrue(restored.hostOnly)
+        val jar = SessionCookieJar(scope, CookieSession(listOf(restored)))
+        assertTrue(jar.loadForRequest(okhttp3.HttpUrl.Companion.run { "https://reader.example.com/".toHttpUrl() }).isEmpty())
+
+        val cert = HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
+        val tls = HandshakeCertificates.Builder().heldCertificate(cert).build()
+        val trust = HandshakeCertificates.Builder().addTrustedCertificate(cert.certificate).build()
+        MockWebServer().use { source -> MockWebServer().use { login ->
+            source.useHttps(tls.sslSocketFactory(), false); source.start()
+            login.useHttps(tls.sslSocketFactory(), false); login.start()
+            val rule = BookSourceRule(source.url("/").toString(), searchUrl = "/search", loginUrl = login.url("/").toString())
+            // 生产配置拒绝私网登录；受控测试显式构造两个获准的本机 origin。
+            val approved = requireNotNull(SourceAuthScope.create(rule.id, rule.baseUrl, listOf(login.url("/").toString())))
+            val sessions = PersistentSourceSessions(store)
+            sessions.open(approved).loginData["\$loginHeader"] = "{\"X-Identity\":\"secret-fixture\"}"
+            val provider = object : SourceSessionProvider {
+                override suspend fun open(scope: SourceAuthScope): SourceRequestSession = sessions.open(approved)
+                override suspend fun forSource(source: BookSourceRule): SourceRequestSession = sessions.open(approved)
+            }
+            val http = SourceHttpClient(OkHttpClient.Builder().sslSocketFactory(trust.sslSocketFactory(), trust.trustManager).build(), allowPrivateNetwork = true)
+            val engine = BookSourceEngine(http, sessions = provider)
+            source.enqueue(MockResponse().setResponseCode(302).setHeader("Location", login.url("/member")))
+            login.enqueue(MockResponse().setBody("fixture"))
+            engine.fetchSearchPage(rule, "fixture")
+            assertEquals("secret-fixture", source.takeRequest().getHeader("X-Identity"))
+            assertNull(login.takeRequest().getHeader("X-Identity"))
+        } }
+    }
+
     @Test fun `阅读请求恢复身份且同站多来源与跨端口重定向隔离`() = runBlocking {
         val cert = HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
         val tls = HandshakeCertificates.Builder().heldCertificate(cert).build()

@@ -43,17 +43,18 @@ class SourceLoginViewModel(
             try {
                 val source = sources.getRule(sourceId)
                 if (source == null) { fail("来源不存在"); return@launch }
-                val config = resolveLoginConfiguration(source)
-                val scope = SourceAuthScope.create(source.id, source.baseUrl)
+                val (config, scope) = withContext(Dispatchers.Default) {
+                    resolveLoginConfiguration(source) to com.radium.inkwell.sourceauth.sourceAuthScope(source)
+                }
                 val page = config as? LoginConfiguration.WebPage
                 mutableState.value = mutableState.value.copy(name = source.name, scope = scope, page = page)
                 if (page == null || scope == null) {
                     fail(when (config) {
                         LoginConfiguration.NotConfigured -> "该来源未配置登录"
                         is LoginConfiguration.Unsupported -> when (config.reason) {
-                            LoginConfiguration.Reason.CUSTOM_UI -> "暂不支持该来源的自定义登录表单"
-                            LoginConfiguration.Reason.SCRIPT_OR_DYNAMIC -> "暂不支持脚本或动态登录规则"
-                            else -> "登录地址不受支持，仅允许同站 HTTPS 页面"
+                            LoginConfiguration.Reason.CUSTOM_UI -> "该来源需要自定义表单，且未声明可识别的网页登录地址"
+                            LoginConfiguration.Reason.SCRIPT_OR_DYNAMIC -> "未找到脚本中明确声明的网页登录地址，暂不执行此登录脚本"
+                            else -> "登录地址不受支持，仅允许明确声明的有效 HTTPS 页面"
                         }
                         else -> "登录配置不可用"
                     })
@@ -79,7 +80,7 @@ class SourceLoginViewModel(
         }
     }
 
-    fun start() { if (mutableState.value.busy || mutableState.value.browsing) return; mutableState.value = mutableState.value.copy(browsing = true, message = "登录中，完成后可保存会话") }
+    fun start() { if (mutableState.value.busy || mutableState.value.browsing) return; mutableState.value = mutableState.value.copy(browsing = true, message = "正在打开登录网页…") }
     fun cancel() { mutableState.value = mutableState.value.copy(browsing = false, message = "已取消，之前保存的会话未修改") }
     fun fail(message: String) { mutableState.value = mutableState.value.copy(loaded = true, browsing = false, busy = false, message = message) }
 

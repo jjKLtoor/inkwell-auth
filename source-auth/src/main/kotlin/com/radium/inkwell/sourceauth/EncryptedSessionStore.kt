@@ -29,13 +29,15 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
             val cookies = session.cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() }
             require(cookies.size <= 256 && session.loginData.size <= 2)
             require(cookies.isNotEmpty() || session.loginData.isNotEmpty())
-            val origin = scope.originUrl.toHttpUrl()
-            require(cookies.all { Cookie.parse(origin, it.toString()) != null })
+            require(cookies.all { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } })
             val plain = ByteArrayOutputStream().use { bytes ->
                 DataOutputStream(bytes).use { out ->
-                    out.writeInt(2)
+                    out.writeInt(3)
                     out.writeInt(cookies.size)
-                    cookies.forEach { out.writeUTF(it.toString()) }
+                    cookies.forEach {
+                        out.writeUTF(it.toString())
+                        out.writeUTF(it.domain)
+                    }
                     out.writeInt(session.loginData.size)
                     session.loginData.forEach { (key, value) -> out.writeUTF(key); out.writeUTF(value) }
                 }
@@ -63,13 +65,15 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
             try {
                 DataInputStream(ByteArrayInputStream(plain)).use { input ->
                     val version = input.readInt()
-                    require(version in 1..2)
+                    require(version in 1..3)
                     val count = input.readInt()
                     require(count in 0..256)
                     val cookies = List(count) {
-                        requireNotNull(Cookie.parse(scope.originUrl.toHttpUrl(), input.readUTF()))
+                        val record = input.readUTF()
+                        val base = if (version >= 3) okhttp3.HttpUrl.Builder().scheme("https").host(input.readUTF()).build() else scope.originUrl.toHttpUrl()
+                        requireNotNull(Cookie.parse(base, record))
                     }
-                    val data = if (version == 2) {
+                    val data = if (version >= 2) {
                         val size = input.readInt()
                         require(size in 0..2)
                         buildMap { repeat(size) { put(input.readUTF(), input.readUTF()) } }
@@ -86,7 +90,7 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
     }
 
     private fun binding(scope: SourceAuthScope): ByteArray = MessageDigest.getInstance("SHA-256")
-        .digest((scope.sourceId + "\u0000" + scope.originUrl).toByteArray(Charsets.UTF_8))
+        .digest((scope.sourceId + "\u0000" + scope.originUrls.joinToString("\u0000")).toByteArray(Charsets.UTF_8))
 
     private fun file(scope: SourceAuthScope): File = File(root, binding(scope).joinToString("") { "%02x".format(it) } + ".auth")
 

@@ -104,8 +104,8 @@ class UpdateChecker(
     }
 
     companion object {
-        const val REPO = "radiumCN/inkwell"
-        const val REPO_URL = "https://github.com/radiumCN/inkwell"
+        const val REPO = "jjKLtoor/inkwell-auth"
+        const val REPO_URL = "https://github.com/jjKLtoor/inkwell-auth"
 
         /**
          * 语义化版本比较，含预发布规则：主版本相同时，正式版 > 预发布版，

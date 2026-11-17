@@ -134,19 +134,27 @@ class SourceHttpClient(
         .followSslRedirects(false)
         .build()
 
+    /** Legado 也接受裸主机名；只在当前获准的 HTTPS 作用域内补全，不能借此读取其它站点身份。 */
+    private fun cookieUrl(value: String): HttpUrl? {
+        value.toHttpUrlOrNull()?.let { return it }
+        val session = SourceRequestSession.current() ?: return null
+        return session.scope.originUrls.mapNotNull { it.toHttpUrlOrNull() }
+            .firstOrNull { it.port == 443 && it.host.equals(value.trim(), ignoreCase = true) }
+    }
+
     /** 书源脚本要读写 cookie（登录态、防盗链 token 都靠它） */
-    fun cookieOf(url: String): String = url.toHttpUrlOrNull()
+    fun cookieOf(url: String): String = cookieUrl(url)
         ?.let { u -> (SourceRequestSession.current() ?: cookieJar).loadForRequest(u).joinToString("; ") { "${it.name}=${it.value}" } }
         .orEmpty()
 
     fun setCookie(url: String, cookie: String) {
-        val u = url.toHttpUrlOrNull() ?: return
+        val u = cookieUrl(url) ?: return
         val cookies = cookie.split(';').mapNotNull { Cookie.parse(u, it.trim()) }
         (SourceRequestSession.current() ?: cookieJar).saveFromResponse(u, cookies)
     }
 
     fun removeCookie(url: String) {
-        url.toHttpUrlOrNull()?.let { url ->
+        cookieUrl(url)?.let { url ->
             val session = SourceRequestSession.current()
             if (session == null) cookieJar.clear(url) else session.saveFromResponse(url, session.loadForRequest(url).map { it.newBuilder().expiresAt(0).build() })
         }
@@ -170,9 +178,10 @@ class SourceHttpClient(
             val sensitive = saved.keys + originalHeaderNames + setOf("Cookie", "Authorization", "Proxy-Authorization")
             if (!permitted) sensitive.forEach { builder.removeHeader(it) }
             else {
+                if (!session.scope.permitsPrimary(request.url.toString())) sensitive.forEach { builder.removeHeader(it) }
                 val cookies = session.loadForRequest(request.url)
                 if (cookies.isNotEmpty()) builder.header("Cookie", cookies.joinToString("; ") { it.name + "=" + it.value })
-                saved.filterKeys { !(it.equals("Cookie", true) && cookies.isNotEmpty()) && !it.equals("Host", true) && !it.equals("Content-Length", true) }
+                (if (session.scope.permitsPrimary(request.url.toString())) saved else emptyMap()).filterKeys { !(it.equals("Cookie", true) && cookies.isNotEmpty()) && !it.equals("Host", true) && !it.equals("Content-Length", true) }
                     .forEach { (name, value) -> if (isValidHeaderName(name) && isValidHeaderValue(value)) builder.header(name, value) }
             }
             chain.proceed(builder.build())

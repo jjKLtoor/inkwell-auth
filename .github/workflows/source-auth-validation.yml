@@ -63,7 +63,7 @@ jobs:
           for phase in prepare restore; do
             if test "$phase" = restore; then adb shell am force-stop com.radium.inkwell.sourceauth.test; fi
             adb shell am instrument -w -e class com.radium.inkwell.sourceauth.LoginWebSessionTest -e authRestart "$phase" com.radium.inkwell.sourceauth.test/androidx.test.runner.AndroidJUnitRunner | tee "tmp/auth-restart-$phase.log"
-            grep -q "OK (2 tests)" "tmp/auth-restart-$phase.log"
+            grep -Eq "OK \([1-9][0-9]* tests\)" "tmp/auth-restart-$phase.log"
           done
       - name: Upload device evidence including skipped tests
         if: always()

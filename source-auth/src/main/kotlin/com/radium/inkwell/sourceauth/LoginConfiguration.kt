@@ -9,7 +9,7 @@ sealed interface LoginConfiguration {
     data object NotConfigured : LoginConfiguration
 
     /** 仅代表配置识别通过，不代表登录 UI、网络请求或会话验证已经实现。 */
-    class WebPage(val url: String) : LoginConfiguration {
+    class WebPage(val url: String, val partial: Boolean = false, val upgraded: Boolean = false, val home: Boolean = false) : LoginConfiguration {
         override fun toString(): String = "WebPage(url=redacted)"
     }
 
@@ -20,7 +20,8 @@ sealed interface LoginConfiguration {
 
 /** 不执行来源脚本、不做 DNS / 网络 IO；真正打开页面前仍须通过 WebViewNetworkGuard。 */
 fun resolveLoginConfiguration(source: BookSourceRule): LoginConfiguration {
-    // 有表单配置就不能假装只开 loginUrl 能完成该来源的自定义登录。
+    webLoginTarget(source)?.let { return LoginConfiguration.WebPage(it.url, it.partial, it.upgraded, it.home) }
+    // 未识别到明确网页时保留不支持原因，不执行任意脚本。
     if (!source.loginUi.isNullOrBlank()) {
         return LoginConfiguration.Unsupported(LoginConfiguration.Reason.CUSTOM_UI)
     }

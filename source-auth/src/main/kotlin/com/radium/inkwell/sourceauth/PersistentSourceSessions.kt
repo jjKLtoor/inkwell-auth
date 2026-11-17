@@ -16,6 +16,9 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
 
     fun storageFailed(scope: SourceAuthScope): Boolean = sessions[scope]?.storageFailed == true
 
+    override suspend fun forSource(source: com.radium.inkwell.core.source.BookSourceRule): SourceRequestSession? =
+        sourceAuthScope(source)?.let { open(it) }
+
     override suspend fun open(scope: SourceAuthScope): SourceRequestSession = mutex.withLock {
         sessions[scope] ?: run {
             var readable = true

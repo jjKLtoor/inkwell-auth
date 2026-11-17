@@ -21,4 +21,7 @@ interface SourceRequestSession : CookieJar {
 
 fun interface SourceSessionProvider {
     suspend fun open(scope: SourceAuthScope): SourceRequestSession
+
+    suspend fun forSource(source: com.radium.inkwell.core.source.BookSourceRule): SourceRequestSession? =
+        SourceAuthScope.create(source.id, source.baseUrl)?.let { open(it) }
 }

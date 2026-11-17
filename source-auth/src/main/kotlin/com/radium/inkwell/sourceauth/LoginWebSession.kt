@@ -27,11 +27,12 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * 独立的短期 profile，不操作默认 CookieManager。平台原生 profile 在交互期间可能落盘，
  * 不宣称它被应用密钥加密；退出等待清理浏览数据，下次进程删除空 profile / 异常残留，且禁止系统备份。
- * 只收集已访问 URL 可见的完整 Cookie，localStorage / 跨站 SSO / 第三方 Cookie 暂不支持。
+ * 只收集已访问 URL 可见的完整 Cookie，localStorage 只在临时 profile 使用，不导出或跨进程恢复；额外 SSO / 第三方 Cookie 不自动放行。
  */
 @SuppressLint("RequiresFeature", "SetJavaScriptEnabled")
 class LoginWebSession(
@@ -40,6 +41,16 @@ class LoginWebSession(
     private val intercept: (WebResourceRequest) -> WebResourceResponse?,
     private val onError: () -> Unit,
 ) {
+    var onPageEvent: (LoginPageEvent) -> Unit = {}
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun event(value: LoginPageEvent) { main.post { if (!closed) onPageEvent(value) } }
+    private fun pageFailure(reason: String) { main.post { if (!closed) { onError(); onPageEvent(LoginPageEvent.Failed(reason)) } } }
+    private fun blockedEvent(url: String, mainFrame: Boolean) {
+        val parsed = okhttp3.HttpUrl.Companion.run { url.toHttpUrlOrNull() }
+        val origin = parsed?.newBuilder()?.encodedPath("/")?.query(null)?.fragment(null)?.username("")?.password("")?.build()?.toString()
+        event(LoginPageEvent.Blocked(origin, mainFrame))
+    }
+
     private val profileName: String
     private val visited = ConcurrentHashMap.newKeySet<String>()
     private val cookies: android.webkit.CookieManager
@@ -70,7 +81,8 @@ class LoginWebSession(
             }
             view.settings.apply {
                 javaScriptEnabled = true
-                domStorageEnabled = false
+                // 现代网页登录常依赖临时网页存储；只存在独立 profile，关闭时一并清理，不导出到引擎。
+                domStorageEnabled = true
                 allowFileAccess = false
                 allowContentAccess = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -84,16 +96,33 @@ class LoginWebSession(
             view.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    if (!scope.permits(url)) return blocked()
+                    if (!scope.permits(url)) { blockedEvent(url, request.isForMainFrame); return blocked() }
                     if (visited.size < 256) visited.add(url)
-                    return intercept(request)
+                    return intercept(request).also { response ->
+                        if (request.isForMainFrame && response != null && response.statusCode >= 400) pageFailure("网络保护阻止了登录页面，或页面返回 HTTP " + response.statusCode)
+                    }
                 }
 
-                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-                    !scope.permits(request.url.toString())
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    val denied = !scope.permits(request.url.toString())
+                    if (denied) blockedEvent(request.url.toString(), request.isForMainFrame)
+                    return denied
+                }
+
+                override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) { event(LoginPageEvent.Loading) }
+                override fun onPageCommitVisible(view: WebView, url: String) {
+                    if (scope.permits(url)) event(LoginPageEvent.Visible)
+                }
+                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                    if (request.isForMainFrame) pageFailure("登录页面返回 HTTP " + response.statusCode)
+                }
+                override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError) {
+                    handler.cancel()
+                    pageFailure("登录页面证书校验失败，已停止加载")
+                }
 
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                    if (request.isForMainFrame) onError()
+                    if (request.isForMainFrame) pageFailure("登录页面网络错误（代码 " + error.errorCode + "），请检查网络后重试")
                 }
             }
             active = true
@@ -110,7 +139,8 @@ class LoginWebSession(
             suspendCancellableCoroutine { continuation ->
                 pendingCookieWrites++
                 try {
-                    cookies.setCookie(scope.originUrl, cookie.toString()) { accepted ->
+                    val cookieOrigin = scope.originUrls.firstOrNull { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } ?: error("Cookie origin not approved")
+                    cookies.setCookie(cookieOrigin, cookie.toString()) { accepted ->
                         pendingCookieWrites--
                         if (continuation.isActive) continuation.resume(accepted)
                         if (closed) beginCleanup()
@@ -125,6 +155,7 @@ class LoginWebSession(
         visited.add(scope.originUrl)
         visited.add(url)
         check(!closed)
+        event(LoginPageEvent.Loading)
         view.loadUrl(url)
     }
 

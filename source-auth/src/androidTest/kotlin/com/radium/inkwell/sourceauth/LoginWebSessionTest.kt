@@ -20,6 +20,33 @@ import org.junit.runner.RunWith
 /** 使用实际 Chromium profile 和完整 Cookie API；只做本地夹具，不访问真实账号或网站。 */
 @RunWith(AndroidJUnit4::class)
 class LoginWebSessionTest {
+    @Test fun 主页面HTTP错误与额外站点跳转均提供明确事件() = runBlocking {
+        withContext(Dispatchers.Main) {
+            assumeTrue(LoginWebSession.supported())
+            val context = InstrumentationRegistry.getInstrumentation().targetContext
+            val scope = requireNotNull(SourceAuthScope.create("error-fixture", "https://example.com/"))
+            val events = java.util.concurrent.ConcurrentLinkedQueue<LoginPageEvent>()
+            val session = LoginWebSession(context, scope, { request ->
+                if (request.url.path == "/error") android.webkit.WebResourceResponse("text/html", "UTF-8", 503, "Unavailable", emptyMap(), java.io.ByteArrayInputStream("fixture error".toByteArray()))
+                else android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream("<html><script>location.href='https://outside.invalid/member?token=fixture-secret'</script></html>".toByteArray()))
+            }, {})
+            session.onPageEvent = { events.add(it) }
+            try {
+                session.start("https://example.com/error", null)
+                kotlinx.coroutines.withTimeout(10000) {
+                    while (events.none { it is LoginPageEvent.Failed && it.reason.contains("503") }) kotlinx.coroutines.delay(100)
+                }
+                session.start("https://example.com/redirect", null)
+                kotlinx.coroutines.withTimeout(10000) {
+                    while (events.none { it is LoginPageEvent.Blocked && it.mainFrame }) kotlinx.coroutines.delay(100)
+                }
+                val blocked = events.filterIsInstance<LoginPageEvent.Blocked>().first()
+                assertEquals("https://outside.invalid/", blocked.origin)
+                assertFalse(events.toString().contains("fixture-secret"))
+            } finally { session.close().await() }
+        }
+    }
+
     @Test fun 网页表单提交后采集加密恢复并退出清理() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val origin = "https://localhost:18443/"

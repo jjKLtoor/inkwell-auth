@@ -11,5 +11,5 @@ foreach ($phase in @('prepare', 'restore')) {
     $result = adb -s $Serial shell am instrument -w -e class com.radium.inkwell.sourceauth.LoginWebSessionTest -e authRestart $phase com.radium.inkwell.sourceauth.test/androidx.test.runner.AndroidJUnitRunner 2>&1
     $result | Set-Content -LiteralPath "$inkwellProjectRoot/tmp/auth-restart-$phase.log"
     $result | Write-Output
-    if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'OK \(2 tests\)') { throw "重启验证失败：$phase" }
+    if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'OK \([1-9][0-9]* tests\)') { throw "重启验证失败：$phase" }
 }

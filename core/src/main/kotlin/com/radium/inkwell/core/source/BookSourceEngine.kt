@@ -154,8 +154,7 @@ class BookSourceEngine(
      */
     private suspend fun <T> engineIo(source: BookSourceRule, block: suspend () -> T): T =
         withContext(Dispatchers.IO) {
-            val scope = com.radium.inkwell.core.source.auth.SourceAuthScope.create(source.id, source.baseUrl)
-            val session = scope?.let { sessions?.open(it) }
+            val session = sessions?.forSource(source)
             withContext(jsHttp.bindingTo(coroutineContext[Job]) + com.radium.inkwell.core.source.auth.SourceRequestSession.binding(session)) {
                 try {
                     block()
