@@ -113,6 +113,7 @@ val appModule = module {
             scriptRuntime = get(),
             renderer = get(),
             globalPurify = { source, bookTitle -> replaceRules.purifyFor(source, bookTitle) },
+            sessions = get<com.radium.inkwell.sourceauth.PersistentSourceSessions>(),
         )
     }
     single { com.radium.inkwell.core.source.rss.RssEngine(http = get(), scriptRuntime = get(), renderer = get()) }
@@ -186,7 +187,8 @@ val appModule = module {
             com.radium.inkwell.sourceauth.KeystoreSessionCipher(),
         )
     }
-    viewModel { (sourceId: String) -> com.radium.inkwell.ui.sourceauth.SourceLoginViewModel(sourceId, get(), get()) }
+    single { com.radium.inkwell.sourceauth.PersistentSourceSessions(get()) }
+    viewModel { (sourceId: String) -> com.radium.inkwell.ui.sourceauth.SourceLoginViewModel(sourceId, get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.sourcewizard.SourceWizardViewModel(get(), get(), get(), get()) }
     viewModel { WebDavViewModel(get(), get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.feedback.FeedbackViewModel(androidContext(), get(), get()) }

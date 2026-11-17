@@ -20,6 +20,83 @@ import org.junit.runner.RunWith
 /** 使用实际 Chromium profile 和完整 Cookie API；只做本地夹具，不访问真实账号或网站。 */
 @RunWith(AndroidJUnit4::class)
 class LoginWebSessionTest {
+    @Test fun 网页表单提交后采集加密恢复并退出清理() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val origin = "https://localhost:18443/"
+        val scope = requireNotNull(SourceAuthScope.create(origin + "#form-fixture", origin))
+        val store = EncryptedSessionStore(java.io.File(context.noBackupFilesDir, "form-fixture"), KeystoreSessionCipher())
+        val phase = InstrumentationRegistry.getArguments().getString("authRestart")
+        val pidFile = java.io.File(context.noBackupFilesDir, "form-fixture-process")
+        if (phase == "restore") {
+            assertTrue(pidFile.readText() != android.os.Process.myPid().toString())
+            val cert = okhttp3.tls.HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
+            val tls = okhttp3.tls.HandshakeCertificates.Builder().heldCertificate(cert).build()
+            val trust = okhttp3.tls.HandshakeCertificates.Builder().addTrustedCertificate(cert.certificate).build()
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.useHttps(tls.sslSocketFactory(), false)
+                server.start(18443)
+                val client = okhttp3.OkHttpClient.Builder()
+                    .sslSocketFactory(trust.sslSocketFactory(), trust.trustManager).build()
+                val sessions = PersistentSourceSessions(store)
+                val engine = com.radium.inkwell.core.source.BookSourceEngine(
+                    com.radium.inkwell.core.source.SourceHttpClient(client, allowPrivateNetwork = true),
+                    sessions = sessions,
+                )
+                val source = com.radium.inkwell.core.source.BookSourceRule(scope.sourceId, searchUrl = "/authorized")
+                server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("authorized fixture"))
+                assertEquals("authorized fixture", engine.fetchSearchPage(source, "fixture").bodyText)
+                assertEquals("form_session=fixture", server.takeRequest().getHeader("Cookie"))
+                sessions.logout(scope)
+                server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("logged out"))
+                engine.fetchSearchPage(source, "fixture")
+                assertEquals(null, server.takeRequest().getHeader("Cookie"))
+                assertEquals(null, store.load(scope))
+                pidFile.delete()
+            }
+            return@runBlocking
+        }
+        store.clear(scope)
+        withContext(Dispatchers.Main) {
+            assumeTrue(LoginWebSession.supported())
+            val session = LoginWebSession(context, scope, { request ->
+                // 由拦截器提供受控 HTTPS 页面，不访问真实账号或站点。
+                val html = if (request.url.path == "/signed") {
+                    "<html><script>document.cookie='form_session=fixture; Path=/; Secure; Max-Age=3600'</script>signed</html>"
+                } else {
+                    "<html><form action='/signed'><input name='fixture' value='local'><button type='submit'>登录</button></form></html>"
+                }
+                android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream(html.toByteArray()))
+            }, { error("fixture page failed") })
+            try {
+                session.start(origin + "login", null)
+                kotlinx.coroutines.withTimeout(15000) {
+                    while (true) {
+                        val ready = kotlinx.coroutines.suspendCancellableCoroutine<String> { continuation ->
+                            session.view.evaluateJavascript("document.querySelector('form') != null") { continuation.resumeWith(Result.success(it)) }
+                        }
+                        if (ready == "true") break
+                        kotlinx.coroutines.delay(100)
+                    }
+                }
+                session.view.evaluateJavascript("document.querySelector('form').submit()", null)
+                val captured = kotlinx.coroutines.withTimeout(15000) {
+                    var value = session.capture()
+                    while (value.cookies.none { it.name == "form_session" }) {
+                        kotlinx.coroutines.delay(100)
+                        value = session.capture()
+                    }
+                    value
+                }
+                store.save(scope, captured)
+                val restored = requireNotNull(store.load(scope))
+                assertTrue(restored.cookies.any { it.name == "form_session" && it.value == "fixture" })
+                session.close().await()
+                if (phase == "prepare") pidFile.writeText(android.os.Process.myPid().toString())
+                else { store.clear(scope); assertEquals(null, store.load(scope)) }
+            } finally { session.close().await(); if (phase != "prepare") store.clear(scope) }
+        }
+    }
+
     @Test fun 临时profile与默认profile隔离且Cookie属性在采集后保留() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val scope = requireNotNull(SourceAuthScope.create("fixture-one", "https://example.com/"))

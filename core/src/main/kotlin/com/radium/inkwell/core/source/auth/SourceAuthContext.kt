@@ -58,7 +58,7 @@ class SourceAuthSnapshot(
 /**
  * 同步调用仅允许读内存，供 Rhino 与 HTTP 统一适配；磁盘恢复由 Android 层异步完成。
  * 调用方必须提供当前来源地址；不能只按域名猜测账号，也不能复用首跳快照处理后续跨域请求。
- * 这是尚未接入引擎的契约，不意味着现有共享 CookieJar 已隔离。
+ * 这是状态快照契约；引擎 Cookie 与 Header 传输由 SourceRequestSession 承担。
  */
 fun interface SourceAuthContext {
     fun snapshot(scope: SourceAuthScope, requestUrl: String): SourceAuthSnapshot?

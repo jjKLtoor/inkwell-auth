@@ -861,7 +861,8 @@ class RuleEvaluator(
      * 没存过、存的不是 JSON 对象为空
      */
     fun loginHeaders(sourceKey: String): Map<String, String> =
-        sourceStores[sourceKey]?.get(com.radium.inkwell.core.source.js.SourceBridge.LOGIN_HEADER)
+        (if (com.radium.inkwell.core.source.auth.SourceRequestSession.current() != null) null
+            else sourceStores[sourceKey])?.get(com.radium.inkwell.core.source.js.SourceBridge.LOGIN_HEADER)
             ?.let { parseHeaderJson(it) }
             .orEmpty()
 

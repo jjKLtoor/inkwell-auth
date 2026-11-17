@@ -1,0 +1,77 @@
+name: Source auth validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify snapshot rollback tests
+        run: node --test tools/update-test-sources.test.mjs
+      - name: Discover and validate latest formal release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node tools/update-test-sources.mjs
+      - name: Upload metadata and compatibility reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-validation-reports
+          path: |
+            tmp/test-sources/**/metadata.json
+            tmp/test-sources/**/diff.json
+            tmp/test-sources/**/matrix.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  android-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Install Android test environment
+        run: |
+          SM="$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" -path '*/cmdline-tools/*/bin/sdkmanager' | head -n 1)"
+          test -n "$SM"
+          yes | "$SM" --licenses >/dev/null || true
+          "$SM" --install 'platforms;android-37.1' 'emulator' 'system-images;android-36;google_apis;x86_64'
+          echo no | avdmanager create avd --name auth-test --package 'system-images;android-36;google_apis;x86_64'
+          sudo chmod a+rw /dev/kvm
+      - name: Start controlled emulator and run auth tests
+        run: |
+          "$ANDROID_HOME/emulator/emulator" -avd auth-test -no-window -no-audio -no-snapshot -gpu swiftshader_indirect > /tmp/auth-emulator.log 2>&1 &
+          trap 'adb emu kill || true' EXIT
+          adb wait-for-device
+          for attempt in $(seq 1 120); do
+            test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1 && break
+            sleep 2
+          done
+          test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
+          ./gradlew :source-auth:testDebugUnitTest :source-auth:connectedDebugAndroidTest
+          mkdir -p tmp
+          adb install -r source-auth/build/outputs/apk/androidTest/debug/source-auth-debug-androidTest.apk
+          for phase in prepare restore; do
+            if test "$phase" = restore; then adb shell am force-stop com.radium.inkwell.sourceauth.test; fi
+            adb shell am instrument -w -e class com.radium.inkwell.sourceauth.LoginWebSessionTest -e authRestart "$phase" com.radium.inkwell.sourceauth.test/androidx.test.runner.AndroidJUnitRunner | tee "tmp/auth-restart-$phase.log"
+            grep -q "OK (2 tests)" "tmp/auth-restart-$phase.log"
+          done
+      - name: Upload device evidence including skipped tests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: auth-device-reports
+          path: |
+            source-auth/build/reports/
+            source-auth/build/outputs/androidTest-results/
+            tmp/auth-restart-*.log
+          retention-days: 7

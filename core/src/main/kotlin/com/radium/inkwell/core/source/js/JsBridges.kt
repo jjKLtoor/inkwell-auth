@@ -334,31 +334,36 @@ class SourceBridge(
     // 不做登录界面：没人填过，就是阅读里「还没登录」的样子 —— getLoginInfo / getLoginInfoMap 为 null。
     // 从前这几个方法不存在，一调就 ReferenceError：霹雳书屋的 jsLib 拼地址前先读一下登录信息，整个源搜不了；
     // 订阅源的 header 脚本包在 try 里倒是不死，但请求头一个也没算出来。
-    // 脚本自己存进来的（一读先过一道脚本挑战、算出 Cookie 后 putLoginHeader）照存，只在进程内
+    // 引擎会话内按来源读写；Header 可加密恢复，登录信息可能含密码，只在进程内保留。
 
-    fun getLoginInfo(): String? = store[LOGIN_INFO]
+    private fun loginStore(): MutableMap<String, String> =
+        com.radium.inkwell.core.source.auth.SourceRequestSession.current()?.let {
+            if (it.active) it.loginData else java.util.concurrent.ConcurrentHashMap<String, String>()
+        } ?: store
+
+    fun getLoginInfo(): String? = loginStore()[LOGIN_INFO]
 
     fun getLoginInfoMap(): JsStringMap? = getLoginInfo()?.let(::jsonStringMap)
 
     fun putLoginInfo(info: String?): Boolean {
-        if (info.isNullOrBlank()) store.remove(LOGIN_INFO) else store[LOGIN_INFO] = info
+        if (info.isNullOrBlank()) loginStore().remove(LOGIN_INFO) else loginStore()[LOGIN_INFO] = info
         return true
     }
 
     fun removeLoginInfo() {
-        store.remove(LOGIN_INFO)
+        loginStore().remove(LOGIN_INFO)
     }
 
-    fun getLoginHeader(): String? = store[LOGIN_HEADER]
+    fun getLoginHeader(): String? = loginStore()[LOGIN_HEADER]
 
     fun getLoginHeaderMap(): JsStringMap? = getLoginHeader()?.let(::jsonStringMap)
 
     fun putLoginHeader(header: String?) {
-        if (header.isNullOrBlank()) store.remove(LOGIN_HEADER) else store[LOGIN_HEADER] = header
+        if (header.isNullOrBlank()) loginStore().remove(LOGIN_HEADER) else loginStore()[LOGIN_HEADER] = header
     }
 
     fun removeLoginHeader() {
-        store.remove(LOGIN_HEADER)
+        loginStore().remove(LOGIN_HEADER)
     }
 
     private fun jsonStringMap(json: String): JsStringMap? = runCatching {

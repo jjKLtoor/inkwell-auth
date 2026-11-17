@@ -25,6 +25,8 @@ import com.radium.inkwell.ui.components.AppTextButton
 import com.radium.inkwell.ui.components.AppTopBar
 import com.radium.inkwell.ui.components.Dimens
 import com.radium.inkwell.ui.components.SecondaryButton
+import com.radium.inkwell.ui.components.PrimaryButton
+import top.yukonga.miuix.kmp.basic.Card
 import com.radium.inkwell.ui.components.rememberAppTopBarScroll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -37,6 +39,7 @@ fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
     var session by remember { mutableStateOf<LoginWebSession?>(null) }
     val coroutineScope = rememberCoroutineScope()
     val topBarScroll = rememberAppTopBarScroll()
+    var capturing by remember { mutableStateOf(false) }
     var supported by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         try {
@@ -44,7 +47,7 @@ fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
             supported = LoginWebSession.supported()
         } catch (_: Exception) { viewModel.fail("临时网页登录数据清理失败，请重试") }
     }
-    BackHandler(state.browsing) { viewModel.cancel() }
+    BackHandler(state.browsing) { if (!capturing) viewModel.cancel() }
     LaunchedEffect(session) {
         val current = session ?: return@LaunchedEffect
         try { current.start(requireNotNull(state.page).url, state.restored) }
@@ -55,12 +58,18 @@ fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
     }
     AppScaffold(
         blurBars = false,
-        topBar = { AppTopBar(state.name, topBarScroll, onBack = { if (state.browsing) viewModel.cancel() else onBack() }) },
+        topBar = { AppTopBar(state.name, topBarScroll, onBack = { if (!capturing && !state.busy) { if (state.browsing) viewModel.cancel() else onBack() } }) },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-            Text(state.message, modifier = Modifier.padding(Dimens.screenPadding))
+            Card(modifier = Modifier.fillMaxWidth().padding(Dimens.screenPadding)) {
+                Column(Modifier.padding(Dimens.listHorizontal)) {
+                    Text(state.message, style = MiuixTheme.textStyles.body1)
+                    state.scope?.let { Text(it.originUrl, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary) }
+                }
+            }
             if (state.browsing && state.scope != null) {
-                SecondaryButton("保存会话（状态未知）", modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.screenPadding), enabled = session != null && !state.busy, onClick = {
+                PrimaryButton(if (capturing) "正在保存会话…" else "完成并保存会话", modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.screenPadding), enabled = session != null && !state.busy && !capturing, onClick = {
+                    capturing = true
                     coroutineScope.launch {
                         try {
                             val current = session ?: return@launch
@@ -70,9 +79,10 @@ fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
                         } catch (error: Exception) {
                             if (error is CancellationException) throw error
                             viewModel.fail("会话读取或临时数据清理失败，请重试")
-                        }
+                        } finally { capturing = false }
                     }
                 })
+                AppTextButton("取消登录", enabled = !capturing, onClick = viewModel::cancel)
                 AndroidView(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     factory = { context ->
@@ -97,11 +107,11 @@ fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
                         modifier = Modifier.padding(Dimens.screenPadding), style = MiuixTheme.textStyles.footnote1,
                     )
                     Text(
-                        "会话目前尚未接入阅读请求。保存会话不代表网站已确认登录。",
+                        "保存后，同站阅读请求会使用对应来源的 Cookie。保存会话不代表网站已确认登录，也不保证搜索或正文规则可用。",
                         modifier = Modifier.padding(horizontal = Dimens.screenPadding), style = MiuixTheme.textStyles.footnote1,
                     )
                     if (!supported) Text("系统 WebView 不支持所需的独立会话能力，请更新 WebView 后重试", modifier = Modifier.padding(Dimens.screenPadding))
-                    SecondaryButton(if (state.restored == null) "登录" else "重新登录",
+                    PrimaryButton(if (state.restored == null) "登录" else "重新登录",
                         modifier = Modifier.fillMaxWidth().padding(Dimens.screenPadding),
                         enabled = state.loaded && state.page != null && supported && !state.busy, onClick = viewModel::start)
                     AppTextButton("退出登录", enabled = state.loaded && state.scope != null && !state.busy, onClick = viewModel::logout)

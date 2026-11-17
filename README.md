@@ -1,6 +1,6 @@
 # Inkwell · 墨水
 
-> 本 Fork 正在开发通用来源认证。当前提供受能力限制的网页登录预览、Keystore 加密 Cookie 保存与恢复；会话尚未接入阅读请求，不代表来源已确认登录。进度与测试边界见 [开发记录](docs/开发记录/2026-11-16-阶段B.md)，本地构建见 [Windows 开发环境](docs/Windows开发环境.md)。
+> 本 Fork 正在开发通用来源认证。当前支持受能力限制的同站 HTTPS 网页登录、Keystore 加密持久 Cookie / 认证 Header，以及阅读引擎的来源会话接入；保存会话不代表来源已确认登录或真实站点测试通过。进度与测试边界见 [开发记录](docs/开发记录/2026-11-17-引擎认证与APK.md)，本地构建见 [Windows 开发环境](docs/Windows开发环境.md)。
 
 > 一款克制、专注的文本阅读器 —— 暖纸质感、仿真翻页、进度永不丢失。本地 txt / EPUB / MOBI(AZW3) 阅读 · 可选自定义规则 · WebDAV 跨端同步。Android 客户端无需账号；[网页版](https://book.skylark.run) 需登录注册后使用。
 
@@ -51,7 +51,7 @@ Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号�
 | `:core` | 纯 JVM：统一书籍模型、txt/EPUB/MOBI 解析器、可选规则引擎（含 Rhino JS）、WebDAV 客户端与备份合并（全部可 JVM 单测） |
 | `:reader` | 阅读排版引擎：Canvas 自绘 + `TextMeasurer` 分页；测量层抽象为接口，分页算法纯 Kotlin 可测 |
 | `:app` | Compose UI、Room、DataStore、导航、DI（Koin）、同步 |
-| `:source-auth` | Android 来源认证预览：独立 WebView profile、加密 Cookie 会话；阅读引擎接入尚未完成 |
+| `:source-auth` | Android 来源认证：独立 WebView profile、加密会话、来源隔离与引擎认证适配 |
 
 技术栈：Kotlin 2.3 · Jetpack Compose · Room · Koin · OkHttp · Jsoup · Rhino · kotlinx.serialization。
 

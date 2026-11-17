@@ -1,5 +1,7 @@
 package com.radium.inkwell.core.source
 
+import com.radium.inkwell.core.source.auth.SourceRequestSession
+import kotlinx.serialization.json.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -102,6 +104,11 @@ class SourceHttpClient(
     private val logger: SourceHttpLogger = SourceHttpLogger.NONE,
 ) {
 
+    private fun safeLog(warn: Boolean, message: String, error: Throwable?) {
+        if (SourceRequestSession.current() != null) logger.log(warn, "来源会话请求（详细地址和异常已隐藏）", null)
+        else logger.log(warn, message, error)
+    }
+
     private val cookieJar = MemoryCookieJar()
 
     private val client: OkHttpClient = baseClient.newBuilder()
@@ -129,17 +136,47 @@ class SourceHttpClient(
 
     /** 书源脚本要读写 cookie（登录态、防盗链 token 都靠它） */
     fun cookieOf(url: String): String = url.toHttpUrlOrNull()
-        ?.let { u -> cookieJar.loadForRequest(u).joinToString("; ") { "${it.name}=${it.value}" } }
+        ?.let { u -> (SourceRequestSession.current() ?: cookieJar).loadForRequest(u).joinToString("; ") { "${it.name}=${it.value}" } }
         .orEmpty()
 
     fun setCookie(url: String, cookie: String) {
         val u = url.toHttpUrlOrNull() ?: return
         val cookies = cookie.split(';').mapNotNull { Cookie.parse(u, it.trim()) }
-        cookieJar.saveFromResponse(u, cookies)
+        (SourceRequestSession.current() ?: cookieJar).saveFromResponse(u, cookies)
     }
 
     fun removeCookie(url: String) {
-        url.toHttpUrlOrNull()?.let { cookieJar.clear(it) }
+        url.toHttpUrlOrNull()?.let { url ->
+            val session = SourceRequestSession.current()
+            if (session == null) cookieJar.clear(url) else session.saveFromResponse(url, session.loadForRequest(url).map { it.newBuilder().expiresAt(0).build() })
+        }
+    }
+
+    /** 每跳重新校验作用域和撤销状态，禁止跨域及跨端口发送身份。 */
+    private fun requestClient(redirects: Boolean): OkHttpClient {
+        val base = if (redirects) client else noRedirectClient
+        val session = SourceRequestSession.current() ?: return base
+        val originalHeaderNames = runCatching {
+            (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject).keys.toSet()
+        }.getOrDefault(emptySet())
+        return base.newBuilder().cookieJar(session).addNetworkInterceptor { chain ->
+            val request = chain.request()
+            val builder = request.newBuilder()
+            val saved = runCatching {
+                (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject)
+                    .mapValues { (_, v) -> (v as JsonPrimitive).content }
+            }.getOrDefault(emptyMap())
+            val permitted = session.active && session.scope.permits(request.url.toString())
+            val sensitive = saved.keys + originalHeaderNames + setOf("Cookie", "Authorization", "Proxy-Authorization")
+            if (!permitted) sensitive.forEach { builder.removeHeader(it) }
+            else {
+                val cookies = session.loadForRequest(request.url)
+                if (cookies.isNotEmpty()) builder.header("Cookie", cookies.joinToString("; ") { it.name + "=" + it.value })
+                saved.filterKeys { !(it.equals("Cookie", true) && cookies.isNotEmpty()) && !it.equals("Host", true) && !it.equals("Content-Length", true) }
+                    .forEach { (name, value) -> if (isValidHeaderName(name) && isValidHeaderValue(value)) builder.header(name, value) }
+            }
+            chain.proceed(builder.build())
+        }.build()
     }
 
     private val buckets = ConcurrentHashMap<String, TokenBucket>()
@@ -172,7 +209,7 @@ class SourceHttpClient(
             val request = buildRequest(httpUrl, method, body, headers, charsetOverride)
             val startNs = System.nanoTime()
             val response = try {
-                execute((if (followRedirects) client else noRedirectClient).newCall(request))
+                execute(requestClient(followRedirects).newCall(request))
             } catch (e: IOException) {
                 // 握手/发请求时被 RST（报错就是一句干巴巴的「Connection reset」）多半是瞬时的：
                 // 连接池里的旧连接被服务端单方面关了、移动网络切基站。再试一次就好，用户却得
@@ -180,15 +217,15 @@ class SourceHttpClient(
                 // 一次为限：被防火墙或 WAF 稳定掐断的站，再试多少次都一样，只是让人多等。
                 if (!disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
                     disconnectRetried = true
-                    logger.log(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
+                    safeLog(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
                     delay(retryBaseDelayMs)
                     continue
                 }
-                logger.log(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
+                safeLog(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
                 throw e
             }
             if (response.code in RETRY_CODES && attempt < MAX_RETRIES) {
-                logger.log(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
+                safeLog(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
                 response.close()
                 delay(retryBaseDelayMs shl attempt) // 指数退避：base、base*2
                 attempt++
@@ -196,17 +233,17 @@ class SourceHttpClient(
             }
             response.use { resp ->
                 if (throwOnHttpError && !resp.isSuccessful) {
-                    logger.log(true, "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms）", null)
+                    safeLog(true, "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms）", null)
                     throw IOException("HTTP ${resp.code}: $url")
                 }
                 val bytes = try {
                     withContext(Dispatchers.IO) { readBounded(resp, url) }
                 } catch (e: IOException) {
-                    logger.log(true, "$method $url → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
+                    safeLog(true, "$method $url → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
                     throw e
                 }
                 val charset = detectCharset(charsetOverride, resp.header("Content-Type"), bytes)
-                logger.log(
+                safeLog(
                     false,
                     "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms，${bytes.size} B，${charset.name()}）",
                     null,
@@ -237,14 +274,14 @@ class SourceHttpClient(
         val request = buildRequest(httpUrl, "GET", null, headers, null)
         val startNs = System.nanoTime()
         val response = try {
-            execute(client.newCall(request))
+            execute(requestClient(true).newCall(request))
         } catch (e: IOException) {
-            logger.log(true, "GET $url（图片）请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
+            safeLog(true, "GET $url（图片）请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
             throw e
         }
         response.use { resp ->
             if (!resp.isSuccessful) {
-                logger.log(true, "GET $url（图片）→ HTTP ${resp.code}", null)
+                safeLog(true, "GET $url（图片）→ HTTP ${resp.code}", null)
                 throw HttpStatusException(resp.code, url)
             }
             return withContext(Dispatchers.IO) { readBounded(resp, url, maxBytes) }

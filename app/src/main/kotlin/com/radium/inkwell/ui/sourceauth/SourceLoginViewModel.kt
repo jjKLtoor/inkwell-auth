@@ -33,6 +33,7 @@ class SourceLoginViewModel(
     private val sourceId: String,
     private val sources: BookSourceRepository,
     private val store: EncryptedSessionStore,
+    private val sessions: com.radium.inkwell.sourceauth.PersistentSourceSessions,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(SourceLoginState())
     val state = mutableState.asStateFlow()
@@ -66,8 +67,9 @@ class SourceLoginViewModel(
                 val restored = store.load(scope)
                 mutableState.value = mutableState.value.copy(loaded = true, restored = restored,
                     message = when {
+                        sessions.storageFailed(scope) -> "会话更新未能保存，请重新登录"
                         restored == null -> "未登录"
-                        restored.cookies.isEmpty() -> "本地会话已过期，需要重新登录"
+                        restored.cookies.isEmpty() && restored.loginData.isEmpty() -> "本地会话已过期，需要重新登录"
                         else -> "会话已保存，登录状态未知"
                     })
             } catch (error: Exception) {
@@ -77,11 +79,12 @@ class SourceLoginViewModel(
         }
     }
 
-    fun start() { mutableState.value = mutableState.value.copy(browsing = true, message = "登录中，完成后可保存会话") }
+    fun start() { if (mutableState.value.busy || mutableState.value.browsing) return; mutableState.value = mutableState.value.copy(browsing = true, message = "登录中，完成后可保存会话") }
     fun cancel() { mutableState.value = mutableState.value.copy(browsing = false, message = "已取消，之前保存的会话未修改") }
     fun fail(message: String) { mutableState.value = mutableState.value.copy(loaded = true, browsing = false, busy = false, message = message) }
 
     fun save(session: CookieSession) {
+        if (mutableState.value.busy) return
         val scope = mutableState.value.scope ?: return
         if (session.cookies.none { it.persistent && it.expiresAt > System.currentTimeMillis() }) {
             mutableState.value = mutableState.value.copy(browsing = false, message = "未发现可恢复的 Cookie，之前保存的会话未修改")
@@ -91,7 +94,7 @@ class SourceLoginViewModel(
         viewModelScope.launch {
             try {
                 // 保存是用户明确发起的操作；离开页面也应完成原子写，不能留下半截会话。
-                withContext(NonCancellable) { store.save(scope, session) }
+                withContext(NonCancellable) { sessions.replace(scope, session) }
                 val restored = store.load(scope)
                 mutableState.value = mutableState.value.copy(busy = false, restored = restored,
                     message = if (restored?.cookies?.isNotEmpty() == true) "会话已保存，登录状态未知" else "未发现可持久化的 Cookie，无法恢复登录")
@@ -103,13 +106,14 @@ class SourceLoginViewModel(
     }
 
     fun logout() {
+        if (mutableState.value.busy || mutableState.value.browsing) return
         val scope = mutableState.value.scope ?: return
         mutableState.value = mutableState.value.copy(busy = true)
         viewModelScope.launch {
             try {
                 withContext(NonCancellable) {
                     withContext(Dispatchers.Main) { com.radium.inkwell.sourceauth.LoginWebSession.cleanupOrphans() }
-                    store.clear(scope)
+                    sessions.logout(scope)
                 }
                 mutableState.value = mutableState.value.copy(busy = false, restored = null, message = "已退出登录")
             } catch (error: Exception) {

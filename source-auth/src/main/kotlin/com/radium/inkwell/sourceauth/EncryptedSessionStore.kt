@@ -27,14 +27,17 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
     suspend fun save(scope: SourceAuthScope, session: CookieSession) = withContext(Dispatchers.IO) {
         mutex.withLock {
             val cookies = session.cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() }
-            require(cookies.isNotEmpty() && cookies.size <= 256)
+            require(cookies.size <= 256 && session.loginData.size <= 2)
+            require(cookies.isNotEmpty() || session.loginData.isNotEmpty())
             val origin = scope.originUrl.toHttpUrl()
             require(cookies.all { Cookie.parse(origin, it.toString()) != null })
             val plain = ByteArrayOutputStream().use { bytes ->
                 DataOutputStream(bytes).use { out ->
-                    out.writeInt(1)
+                    out.writeInt(2)
                     out.writeInt(cookies.size)
                     cookies.forEach { out.writeUTF(it.toString()) }
+                    out.writeInt(session.loginData.size)
+                    session.loginData.forEach { (key, value) -> out.writeUTF(key); out.writeUTF(value) }
                 }
                 bytes.toByteArray()
             }
@@ -59,14 +62,20 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
             val plain = cipher.decrypt(file.readBytes(), binding(scope))
             try {
                 DataInputStream(ByteArrayInputStream(plain)).use { input ->
-                    require(input.readInt() == 1)
+                    val version = input.readInt()
+                    require(version in 1..2)
                     val count = input.readInt()
                     require(count in 0..256)
                     val cookies = List(count) {
                         requireNotNull(Cookie.parse(scope.originUrl.toHttpUrl(), input.readUTF()))
                     }
+                    val data = if (version == 2) {
+                        val size = input.readInt()
+                        require(size in 0..2)
+                        buildMap { repeat(size) { put(input.readUTF(), input.readUTF()) } }
+                    } else emptyMap()
                     require(input.available() == 0)
-                    CookieSession(cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() })
+                    CookieSession(cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() }, data)
                 }
             } finally { plain.fill(0) }
         }

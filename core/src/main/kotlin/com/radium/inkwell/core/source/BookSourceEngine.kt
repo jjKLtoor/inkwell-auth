@@ -127,7 +127,11 @@ class BookSourceEngine(
     scriptRuntime: com.radium.inkwell.core.source.js.ScriptRuntime? = null,
     /** JS 渲染回退；未注入时行为与从前完全一致 */
     private val renderer: PageRenderer? = null,
+    private val sessions: com.radium.inkwell.core.source.auth.SourceSessionProvider? = null,
 ) {
+
+    private val safeTrace: RuleTraceCollector?
+        get() = if (com.radium.inkwell.core.source.auth.SourceRequestSession.current()?.let { !it.active || it.hasCredentials } == true) null else trace
 
     private val jsHttp = com.radium.inkwell.core.source.js.EngineJsHttp(http)
     private val evaluator = RuleEvaluator(
@@ -148,9 +152,11 @@ class BookSourceEngine(
      * 绑定走协程上下文元素而不是 set/remove：block 里第一次挂起后恢复到哪根 IO 线程
      * 不由我们定，裸 ThreadLocal 会在换线程后失联（详见 [EngineJsHttp.bindingTo]）。
      */
-    private suspend fun <T> engineIo(block: suspend () -> T): T =
+    private suspend fun <T> engineIo(source: BookSourceRule, block: suspend () -> T): T =
         withContext(Dispatchers.IO) {
-            withContext(jsHttp.bindingTo(coroutineContext[Job])) {
+            val scope = com.radium.inkwell.core.source.auth.SourceAuthScope.create(source.id, source.baseUrl)
+            val session = scope?.let { sessions?.open(it) }
+            withContext(jsHttp.bindingTo(coroutineContext[Job]) + com.radium.inkwell.core.source.auth.SourceRequestSession.binding(session)) {
                 try {
                     block()
                 } catch (e: Exception) {
@@ -160,11 +166,13 @@ class BookSourceEngine(
                     // 正是本项目「catch 前先 rethrow 取消」要防的那件事。外层已在取消，就还原成取消。
                     if (e !is CancellationException) currentCoroutineContext().ensureActive()
                     throw e
+                } finally {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { session?.flush() }
                 }
             }
         }
     suspend fun search(source: BookSourceRule, keyword: String, page: Int = 1): SearchPage =
-        engineIo {
+        engineIo(source) {
             val searchUrl = source.searchUrl?.takeIf { it.isNotBlank() }
                 ?: throw SourceException("来源「${source.name}」未配置搜索规则")
             val rule = source.ruleSearch ?: throw SourceException("来源「${source.name}」未配置搜索规则")
@@ -185,7 +193,7 @@ class BookSourceEngine(
      * 拿 WebView 里看到的页面去认，规则可能套不上引擎抓到的静态页。只要求有 searchUrl，不要求有 ruleSearch。
      */
     suspend fun fetchSearchPage(source: BookSourceRule, keyword: String, page: Int = 1): FetchedPage =
-        engineIo {
+        engineIo(source) {
             val searchUrl = source.searchUrl?.takeIf { it.isNotBlank() }
                 ?: throw SourceException("来源「${source.name}」未配置搜索地址")
             val vars = varsOf(source, "key" to keyword, "keyword" to keyword, "page" to page.toString())
@@ -200,7 +208,7 @@ class BookSourceEngine(
         templates.any { it != null && PAGE_VAR.containsMatchIn(it) }
 
     suspend fun explore(source: BookSourceRule, exploreIndex: Int, page: Int = 1): SearchPage =
-        engineIo {
+        engineIo(source) {
             val item = source.explore.getOrNull(exploreIndex)
                 ?: throw SourceException("来源「${source.name}」发现页下标越界: $exploreIndex")
             // Legado：发现页列表规则缺省时复用搜索规则。「缺省」看的是 bookList 空不空，不是
@@ -240,7 +248,7 @@ class BookSourceEngine(
         bookUrl: String,
         variables: Map<String, String> = emptyMap(),
     ): RemoteBookDetail =
-        engineIo {
+        engineIo(source) {
             val url = resolveUrl(source.baseUrl, bookUrl)
             // 详情页解析不出来也不判死：书名/作者在搜索结果里早就拿到了，详情页只是「有就覆盖」。
             // 真正决定这本书能不能读的是目录 —— 让下一步去报错，那才是有信息量的错误。
@@ -323,7 +331,7 @@ class BookSourceEngine(
         bookAuthor: String = "",
         variables: Map<String, String> = emptyMap(),
     ): List<RemoteChapter> =
-        engineIo {
+        engineIo(source) {
             val rule = source.ruleToc ?: throw SourceException("来源「${source.name}」未配置目录规则")
             withRenderFallback(source, "toc") { render ->
                 collectToc(source, rule, tocUrl, render, bookUrl, bookTitle, bookAuthor, variables)
@@ -456,7 +464,7 @@ class BookSourceEngine(
         bookUrl: String = "",
         bookTitle: String = "",
         variables: Map<String, String> = emptyMap(),
-    ): RemoteChapterContent = engineIo {
+    ): RemoteChapterContent = engineIo(source) {
         val rule = source.ruleContent ?: throw SourceException("来源「${source.name}」未配置正文规则")
         val result = if (allowJsRender) {
             withRenderFallback(source, "content") { render ->
@@ -482,7 +490,7 @@ class BookSourceEngine(
      * 不一上来就带：有的图床反过来，带了别的站就回一张「禁止外链」的占位图（正常返回，没有机会重试），
      * 订阅文章的图也是这么取的（见 app 的 ImageReferer）。
      */
-    suspend fun getImage(source: BookSourceRule, imageUrl: String): ByteArray = engineIo {
+    suspend fun getImage(source: BookSourceRule, imageUrl: String): ByteArray = engineIo(source) {
         val split = splitUrlOptions(imageUrl)
         val url = resolveUrl(source.baseUrl, split?.first ?: imageUrl)
         val headers = mergeHeaders(sourceHeaders(source), split?.second?.headers.orEmpty(), varsOf(source))
@@ -637,7 +645,7 @@ class BookSourceEngine(
     }
 
     private fun recentKey(source: BookSourceRule, url: String, render: Boolean): String? {
-        if (trace != null) return null
+        if (trace != null || com.radium.inkwell.core.source.auth.SourceRequestSession.current() != null) return null
         val opt = splitUrlOptions(url)?.second
         if (opt != null && (opt.body != null || !(opt.method ?: "GET").equals("GET", ignoreCase = true))) return null
         return source.id + "\u0000" + render + "\u0000" + pageKey(url)
@@ -743,12 +751,15 @@ class BookSourceEngine(
 
     /** 交给渲染器；没注入渲染器或渲染失败返回 null，调用方退回静态抓取 */
     private suspend fun render(target: String, headers: Map<String, String>): FetchedPage? {
+        // 后台渲染使用默认 profile；有身份的请求不得进入共享网页环境。
+        val session = com.radium.inkwell.core.source.auth.SourceRequestSession.current()
+        if (session?.hasCredentials == true) return null
         val r = renderer ?: return null
         // UA 必须与静态抓取一致：站点常按 UA 给不同 DOM，规则是照静态那份写的
         val ua = headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
             ?: SourceHttpClient.DEFAULT_UA
         return r.render(target, headers.withoutLegadoOnlyHeaders(), ua)?.also { page ->
-            trace?.onFetch(
+            safeTrace?.onFetch(
                 FetchTrace(target, "RENDER", page.statusCode, page.finalUrl, page.detectedCharset, page.bodyText.take(500))
             )
         }
@@ -799,7 +810,7 @@ class BookSourceEngine(
         rateLimit: RateLimitRule?,
     ): FetchedPage {
         val page = http.fetch(url, method, body, headers, charset, rateLimit)
-        trace?.onFetch(
+        safeTrace?.onFetch(
             FetchTrace(
                 requestUrl = url,
                 method = method.uppercase(),
@@ -842,7 +853,7 @@ class BookSourceEngine(
         )
         val out = evaluator.evalSourceScript(script, ctx)
         val headers = parseHeaderJson(out)
-        trace?.onRule(
+        safeTrace?.onRule(
             RuleTrace("header", "header", script, out, error = if (headers.isEmpty()) "header 脚本没有返回请求头" else null),
         )
         return headers
@@ -950,10 +961,10 @@ class BookSourceEngine(
     ): List<EvalContext> =
         try {
             val nodes = evaluator.evalToNodes(LegadoRuleAnalyzer.analyze(rule), ctx)
-            trace?.onRule(RuleTrace(stage, name, rule, "${nodes.size} 个节点"))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, "${nodes.size} 个节点"))
             nodes
         } catch (e: Exception) {
-            trace?.onRule(RuleTrace(stage, name, rule, null, e.message))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, null, e.message))
             throw e
         }
 
@@ -986,10 +997,10 @@ class BookSourceEngine(
         if (rule.isNullOrBlank()) return emptyList()
         return try {
             val values = flattenUrlResults(evaluator.evalToStrings(LegadoRuleAnalyzer.analyze(rule), ctx))
-            trace?.onRule(RuleTrace(stage, name, rule, values.joinToString(" | ").take(200)))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, values.joinToString(" | ").take(200)))
             values
         } catch (e: Exception) {
-            trace?.onRule(RuleTrace(stage, name, rule, null, e.message))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, null, e.message))
             throw e
         }
     }
@@ -999,10 +1010,10 @@ class BookSourceEngine(
         if (rule.isNullOrBlank()) return null
         return try {
             val value = evaluator.evalToString(LegadoRuleAnalyzer.analyze(rule), ctx)
-            trace?.onRule(RuleTrace(stage, name, rule, value?.take(200)))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, value?.take(200)))
             value
         } catch (e: Exception) {
-            trace?.onRule(RuleTrace(stage, name, rule, null, e.message))
+            safeTrace?.onRule(RuleTrace(stage, name, rule, null, e.message))
             throw e
         }
     }

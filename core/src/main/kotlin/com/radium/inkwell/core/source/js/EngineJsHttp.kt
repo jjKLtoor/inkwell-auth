@@ -124,7 +124,9 @@ class EngineJsHttp(
         // 外层已经取消了就别再发：同一段脚本里后面的 java.ajax、目录逐条执行的脚本都会走到这里，
         // 每一个都会实打实跑完一整个请求（最长 [timeout]），用户早就离开了页面
         if (parent?.isCancelled == true) return null
-        return runBlocking {
+        return runBlocking(com.radium.inkwell.core.source.auth.SourceRequestSession.binding(
+            com.radium.inkwell.core.source.auth.SourceRequestSession.current(),
+        )) {
             val blockingScope = this
             // 看门协程**挂在外层 Job 之下**：父一进入 cancelling，子立刻被取消 —— 这才是我们要的
             // 「外层取消」信号。从前写的是 `p.join()`，等的却是父「完成」；而父此刻正被这个
