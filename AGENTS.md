@@ -58,6 +58,7 @@
 
 ## 五、Git、测试与交付
 
+- 本地打包和发布版本必须与用户指定的 fork 仓库基线版本一致（当前为 `0.5.9`）；认证模块修改、调试修复或重新打包均不得自行递增版本号。构建差异通过文件名、提交号和交付说明区分；只有用户明确要求升级版本时才修改版本号。安装由用户自行处理，不主动安装、降级或卸载手机应用。
 - 本仓库提交身份固定为 `jjKLtoor <131401293+jjKLtoor@users.noreply.github.com>`。仅使用 `git config --local user.name jjKLtoor` 与 `git config --local user.email 131401293+jjKLtoor@users.noreply.github.com`，不得修改全局 Git 身份。每次提交前核对有效的 Author / Committer；修改已推送提交的身份必须有用户明确授权，不自动改写远端历史。
 - `origin`：`jjKLtoor/inkwell-auth`；`upstream`：`radiumCN/inkwell`。`main` 为稳定集成分支，`feature/source-auth` 为功能开发分支（存在与否先检查）。上游通过 Fetch + Merge / PR 同步，**不使用 `reset --hard` 覆盖自定义代码**。
 - 每次上游更新必须验证模块编译、Koin、HTTP、WebView、Room 迁移与原有阅读功能，并核查变更是否触及认证扩展点。

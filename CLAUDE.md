@@ -201,6 +201,7 @@ Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)
 ## 发布流程
 
 - 版本号**唯一来源**：`gradle/libs.versions.toml` 的 `inkwell = "x.y.z"`。CI 校验 tag 必须等于 `v$版本`。
+- 本 fork 在基础仓库上补充登录认证模块，打包版本保持与用户指定的 fork 基线一致（当前 `0.5.9`）。认证模块迭代、修复或重打包不得自行递增版本；通过文件名、提交号和说明区分构建，只有用户明确要求升级版本时才修改。先核对 fork 基线，不因认证功能进展推断应升级版本；安装由用户自行处理。
 - 发布 = 打**附注 tag** `vx.y.z` 并推送 → 触发 `.github/workflows/release.yml`。
 - **tag 注解正文 = GitHub Release 正文 = 应用内更新弹窗内容 = 关于页点「版本」看到的内容**。CI 会自动剔掉 `Co-Authored-By`/`Signed-off-by` trailer 和 `Full Changelog`。
 - 关于页那份是打包前写进安装包的（release.yml 的「Extract tag message」把正文与 tag 日期写进 `app/src/main/assets/release/`，该目录不入库；读取见 `BundledReleaseNotes`）：所以那一步**必须在 `assembleRelease` 之前**。本地编的包没有它，弹窗里写「这个安装包没有附带更新说明」。
