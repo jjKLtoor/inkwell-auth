@@ -16,6 +16,60 @@ class JdkCompatTest {
 
     private val runtime = RhinoScriptRuntime()
 
+    @Test fun `大整数按 JDK 运算但位数和原生计算量受限`() {
+        assertEquals("255", runtime.eval("String(new Packages.java.math.BigInteger(1,bytes))", mapOf("bytes" to byteArrayOf(-1))))
+        assertFails { runtime.eval("new Packages.java.math.BigInteger(2,bytes)", mapOf("bytes" to byteArrayOf(1))) }
+        assertEquals("24", runtime.eval("var B=Packages.java.math.BigInteger;String(B.valueOf(2).modPow(new B('10',10),new B('1000',10)))", emptyMap()))
+        assertEquals("16|true", runtime.eval("""
+            var R=Packages.java.security.SecureRandom,B=Packages.java.math.BigInteger;
+            var r=new R();var n=new B(256,r);
+            r.generateSeed(16).length+'|'+(n.bitLength()<=256);
+        """.trimIndent(), emptyMap()))
+        assertFails { runtime.eval("new Packages.java.math.BigInteger(2147483647,new Packages.java.security.SecureRandom())", emptyMap()) }
+        assertFails { runtime.eval("new Packages.java.security.SecureRandom().generateSeed(2147483647)", emptyMap()) }
+        assertFails { runtime.eval("""
+            var B=Packages.java.math.BigInteger;
+            var n=new B('f'.repeat(1024),16);B.valueOf(2).modPow(n,n);
+        """.trimIndent(), emptyMap()) }
+        // 上一次拒绝不污染后续调用的预算，也不开放底层真实对象。
+        assertEquals("8", runtime.eval("var B=Packages.java.math.BigInteger;String(B.valueOf(2).modPow(B.valueOf(3),B.valueOf(11)))", emptyMap()))
+        assertEquals("undefined", runtime.eval("typeof new Packages.java.math.BigInteger('7',10).value", emptyMap()))
+        assertFails { runtime.eval("new Packages.java.math.BigInteger('7',10).getClass().forName('java.lang.Runtime')", emptyMap()) }
+    }
+
+    @Test fun `UUID 字符集与内存 GZIP 往返且没有文件能力`() {
+        val uuid = runtime.eval("String(Packages.java.util.UUID.randomUUID())", emptyMap())!!
+        assertEquals(uuid, java.util.UUID.fromString(uuid).toString())
+        assertEquals("UTF-8", runtime.eval("String(Packages.java.nio.charset.Charset.forName('utf8'))", emptyMap()))
+        val text = "内存压缩第一行\n第二行"
+        val packed = runtime.eval("""
+            var b = new Packages.java.io.ByteArrayOutputStream();
+            var g = new Packages.java.util.zip.GZIPOutputStream(b);
+            var s = new Packages.java.lang.String(result).getBytes(Packages.java.nio.charset.Charset.forName('UTF-8'));
+            g.write(s, 0, s.length); g.close();
+            Packages.java.util.Base64.getEncoder().encodeToString(b.toByteArray());
+        """.trimIndent(), mapOf("result" to text))!!
+        assertEquals(text, java.util.zip.GZIPInputStream(Base64.getDecoder().decode(packed).inputStream()).reader().readText())
+        assertEquals("内存压缩第一行|第二行|null", runtime.eval("""
+            var input = new Packages.java.io.ByteArrayInputStream(Packages.java.util.Base64.getDecoder().decode(result));
+            var g = new Packages.java.util.zip.GZIPInputStream(input);
+            var r = new Packages.java.io.BufferedReader(new Packages.java.io.InputStreamReader(g,'UTF-8'));
+            String(r.readLine())+'|'+String(r.readLine())+'|'+String(r.readLine());
+        """.trimIndent(), mapOf("result" to packed)))
+        assertFails { runtime.eval("new Packages.java.io.ByteArrayOutputStream(2147483647)", emptyMap()) }
+        assertFails { runtime.eval("new Packages.java.io.File('/private')", emptyMap()) }
+        assertFails { runtime.eval("new Packages.java.io.ByteArrayOutputStream().getClass().forName('java.io.File')", emptyMap()) }
+    }
+
+    @Test fun `压缩输入与解压输出各自有大小上限`() {
+        val large = ByteArray(SCRIPT_BUFFER_LIMIT + 1)
+        assertFails { MemoryOutputStreamShim().write(large) }
+        assertFails { GzipOutputStreamShim(MemoryOutputStreamShim()).write(large) }
+        val bos = java.io.ByteArrayOutputStream()
+        java.util.zip.GZIPOutputStream(bos).use { it.write(large) }
+        assertFails { gunzip(MemoryInputStreamShim(bos.toByteArray())) }
+    }
+
     /** 七猫接口源解正文的原样写法：密文 = Base64(IV 16 字节 + AES/CBC 密文) */
     private val qimaoDecode = """
         var javaImport = new JavaImporter();
@@ -75,7 +129,8 @@ class JdkCompatTest {
     @Test
     fun `替身之外的 JDK 类一个都没有 —— Runtime、System、文件照样够不着`() {
         assertEquals("undefined", runtime.eval("typeof Packages.java.lang.Runtime", emptyMap()))
-        assertEquals("undefined", runtime.eval("typeof Packages.java.io", emptyMap()))
+        assertEquals("undefined", runtime.eval("typeof Packages.java.io.File", emptyMap()))
+        assertEquals("undefined", runtime.eval("typeof Packages.java.io.FileInputStream", emptyMap()))
         assertEquals(
             "undefined",
             runtime.eval("var i = new JavaImporter(Packages.java.lang); with (i) { typeof System }", emptyMap()),

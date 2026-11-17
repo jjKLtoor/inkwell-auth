@@ -102,6 +102,8 @@ class SourceHttpClient(
     /** 允许书源访问内网地址。**只该在测试里开**（MockWebServer 跑在 127.0.0.1 上） */
     allowPrivateNetwork: Boolean = false,
     private val logger: SourceHttpLogger = SourceHttpLogger.NONE,
+    /** WebView 代理已由独立 profile 管理 Cookie，不能再让 OkHttp 的缓存覆盖浏览器最新值。 */
+    useMemoryCookieJar: Boolean = true,
 ) {
 
     private fun safeLog(warn: Boolean, message: String, error: Throwable?) {
@@ -112,7 +114,7 @@ class SourceHttpClient(
     private val cookieJar = MemoryCookieJar()
 
     private val client: OkHttpClient = baseClient.newBuilder()
-        .cookieJar(cookieJar)
+        .cookieJar(if (useMemoryCookieJar) cookieJar else CookieJar.NO_COOKIES)
         .guardPrivateNetwork(allowPrivate = allowPrivateNetwork)
         // 超时必须显式配：OkHttp 默认 connect/read/write 各 10 秒，且**没有 callTimeout**。
         // 没有总闸的话，一个每 9 秒吐一个字节的站能把这次调用无限期挂住 —— 而书源脚本那条路
@@ -214,6 +216,8 @@ class SourceHttpClient(
         throwOnHttpError: Boolean = true,
         /** false：3xx 原样交回（带着 Location），不往下跳 */
         followRedirects: Boolean = true,
+        maxResponseBytes: Long = MAX_BODY_BYTES,
+        retryTransientErrors: Boolean = true,
     ): FetchedPage {
         dataUriPage(url)?.let { return it }
         val httpUrl = url.toHttpUrlOrNull() ?: throw IOException("非法 URL: $url")
@@ -232,7 +236,7 @@ class SourceHttpClient(
                 // 连接池里的旧连接被服务端单方面关了、移动网络切基站。再试一次就好，用户却得
                 // 自己点重试。只重试 GET/HEAD —— POST 可能已经送达，重放会把提交做两遍。
                 // 一次为限：被防火墙或 WAF 稳定掐断的站，再试多少次都一样，只是让人多等。
-                if (!disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
+                if (retryTransientErrors && !disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
                     disconnectRetried = true
                     safeLog(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
                     delay(retryBaseDelayMs)
@@ -241,7 +245,7 @@ class SourceHttpClient(
                 safeLog(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
                 throw e
             }
-            if (response.code in RETRY_CODES && attempt < MAX_RETRIES) {
+            if (retryTransientErrors && response.code in RETRY_CODES && attempt < MAX_RETRIES) {
                 safeLog(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
                 response.close()
                 delay(retryBaseDelayMs shl attempt) // 指数退避：base、base*2
@@ -254,7 +258,7 @@ class SourceHttpClient(
                     throw IOException("HTTP ${resp.code}: $url")
                 }
                 val bytes = try {
-                    withContext(Dispatchers.IO) { readBounded(resp, url) }
+                    withContext(Dispatchers.IO) { readBounded(resp, url, maxResponseBytes.coerceIn(1, MAX_BODY_BYTES)) }
                 } catch (e: IOException) {
                     safeLog(true, "$method $url → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
                     throw e

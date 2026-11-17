@@ -8,6 +8,8 @@ internal class SessionBoundJsHttp(private val delegate: JsHttp, private val sess
     override fun fetch(url: String, method: String, body: String?, headers: Map<String,String>, followRedirects: Boolean) =
         bound { delegate.fetch(url,method,body,headers,followRedirects) }
     override fun fetchAll(requests: List<JsHttpRequest>) = bound { delegate.fetchAll(requests) }
+    override fun fetchBinary(url: String, method: String, body: ByteArray?, headers: Map<String,String>, timeoutMs: Long) =
+        bound { delegate.fetchBinary(url, method, body, headers, timeoutMs) }
     override fun cookieOf(url: String) = bound { delegate.cookieOf(url) }
     override fun setCookie(url: String, cookie: String) = bound { delegate.setCookie(url,cookie) }
     override fun removeCookie(url: String) = bound { delegate.removeCookie(url) }

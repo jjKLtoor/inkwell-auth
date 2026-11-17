@@ -38,6 +38,21 @@ class SourceHttpClientTest {
         Buffer().write(html.toByteArray(charset("GBK")))
 
     @Test
+    fun `browser owned cookies are not overwritten or replayed by proxy cache`() = runBlocking {
+        val proxy = SourceHttpClient(allowPrivateNetwork = true, useMemoryCookieJar = false)
+        server.enqueue(MockResponse().addHeader("Set-Cookie", "sid=server-old; Path=/").setBody("first"))
+        server.enqueue(MockResponse().setBody("second"))
+        server.enqueue(MockResponse().setBody("anonymous"))
+        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to "sid=browser-before"))
+        // 模拟页面执行脚本后更新 Cookie，网络层必须原样使用 profile 的最新结果。
+        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to "sid=browser-updated; script=yes"))
+        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to ""))
+        assertEquals("sid=browser-before", server.takeRequest().getHeader("Cookie"))
+        assertEquals("sid=browser-updated; script=yes", server.takeRequest().getHeader("Cookie"))
+        assertEquals("", server.takeRequest().getHeader("Cookie"))
+    }
+
+    @Test
     fun `charset from content type header, gbk decoded as gb18030`() = runBlocking {
         server.enqueue(
             MockResponse()

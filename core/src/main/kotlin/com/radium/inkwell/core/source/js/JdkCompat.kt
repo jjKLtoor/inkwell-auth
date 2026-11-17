@@ -19,17 +19,36 @@ import javax.crypto.spec.SecretKeySpec
  *
  * 我们的脚本沙箱只放行桥对象所在的包（[RhinoScriptRuntime.BRIDGE_ONLY]），`Packages`、`JavaImporter` 根本不存在，
  * 这类来源的正文一律是空的。**不放宽沙箱**：真把 JDK 类交给脚本，`getClass()`、反射、`Runtime` 的口子就又开了。
- * 改成在这个包里照 JDK 的样子写几样**纯计算**的替身 —— Base64、Arrays、String、Cipher 和三种密钥 / 参数规格、MessageDigest、Inflater、Thread.sleep，
+ * 改成在这个包里照 JDK 的样子提供**纯计算 / 内存**替身 —— 编码、加密、随机数、大整数及有界压缩流，
  * 方法名、参数照 JDK，脚本不用改；真正的 JDK 对象都攥在这些类的私有字段里，不交给脚本。
  * 阅读跑在 Android 上，另有一批来源（连城读书、书耽、柚免费耽美……）导的是 `Packages.android.util`，
  * Base64 用的是 Android 那套 `decode(字节, 2)` / `encodeToString(字节, NO_WRAP)`，也照它做了（[AndroidBase64]）。
  * 替身之外的类（`java.io.File`、`java.lang.Runtime`、`java.lang.System`……）在 `Packages` 里压根没有，
  * 导进来也是 undefined，和从前一样跑不起来。
+ * `URL` 仅映射到 JavaBridge 的受控 HTTP 出口，不创建原生连接，来源身份、私网、超时与取消仍由原有管道保护。
  * `org.jsoup`（Jsoup、Connection、TextNode、Parser）也挂在这棵树上，替身本身在 JsoupShim。
  *
  * 只在脚本里出现这几个名字时才装（[COMPAT_TRIGGERS]），装在这一次求值自己的作用域上（[PRELUDE]），不串到别的来源。
  */
 class JdkCompat {
+
+    /** 随机标识与字符集只返回字符串，不把 UUID / Charset 的 JDK 对象交给脚本。 */
+    fun randomUuid(): String = java.util.UUID.randomUUID().toString()
+    fun charsetName(name: String): String = charset(name).name()
+    fun memoryOutput(size: Int): MemoryOutputStreamShim = MemoryOutputStreamShim(size)
+    fun memoryInput(bytes: ByteArray): MemoryInputStreamShim = MemoryInputStreamShim(bytes)
+    fun gzipOutput(target: MemoryOutputStreamShim): GzipOutputStreamShim = GzipOutputStreamShim(target)
+    fun gzipInput(input: MemoryInputStreamShim): MemoryInputStreamShim = gunzip(input)
+    fun memoryReader(input: MemoryInputStreamShim, charset: String): MemoryReaderShim = MemoryReaderShim(input, charset)
+    fun secureRandom(): SecureRandomShim = SecureRandomShim()
+    fun bigInteger(text: String, radix: Int): BigIntegerShim = parseBigInteger(text, radix)
+    fun randomInteger(bits: Int, random: SecureRandomShim): BigIntegerShim = random.randomInteger(bits)
+    fun signedInteger(sign: Int, bytes: ByteArray): BigIntegerShim {
+        require(bytes.size <= 512) { "脚本大整数超过大小限制" }
+        checkMemoryOperation()
+        return BigIntegerShim(java.math.BigInteger(sign, bytes))
+    }
+    fun longInteger(value: Long): BigIntegerShim = BigIntegerShim(java.math.BigInteger.valueOf(value))
 
     /** `java.lang.String(x)` / `String(bytes, charset)`：字节按 UTF-8（或给定编码）解，别的转成字符串 */
     fun string(value: Any?): String = when (value) {
@@ -192,8 +211,22 @@ class JdkCompat {
   var Md = cls('MessageDigest', null, { getInstance: function (alg) { return jdk.messageDigest(String(alg)); } });
   var Infl = cls('Inflater', function (nowrap) { return jdk.inflater(!!nowrap); });
   var Thr = cls('Thread', null, { sleep: function (ms) { jdk.sleep(Number(ms) || 0); } });
+  var Uuid = cls('UUID', null, { randomUUID: function () { return String(jdk.randomUuid()); } });
+  var Charset = cls('Charset', null, { forName: function (n) { return String(jdk.charsetName(String(n))); } });
+  var Bos = cls('ByteArrayOutputStream', function (n) { return jdk.memoryOutput(n == null ? 32 : Number(n)); });
+  var Bis = cls('ByteArrayInputStream', function (b) { return jdk.memoryInput(b); });
+  var Gzos = cls('GZIPOutputStream', function (out) { return jdk.gzipOutput(out); });
+  var Gzis = cls('GZIPInputStream', function (input) { return jdk.gzipInput(input); });
+  var Isr = cls('InputStreamReader', function (input, enc) { return jdk.memoryReader(input, enc == null ? 'UTF-8' : String(enc)); });
+  var Br = cls('BufferedReader', function (reader) { return reader; });
+  var Rng = cls('SecureRandom', function () { return jdk.secureRandom(); });
+  var BigInt = cls('BigInteger', function (a, b) {
+    if (typeof a === 'number') return b != null && typeof b.length === 'number' ? jdk.signedInteger(a, b) : jdk.randomInteger(a, b);
+    return jdk.bigInteger(String(a), b == null ? 10 : Number(b));
+  }, { valueOf: function (n) { return jdk.longInteger(n); }, ONE: jdk.longInteger(1), ZERO: jdk.longInteger(0) });
   var UrlEnc = cls('URLEncoder', null, { encode: function (s, enc) { return jdk.urlEncode(str(s), enc == null ? 'UTF-8' : String(enc)); } });
   var UrlDec = cls('URLDecoder', null, { decode: function (s, enc) { return jdk.urlDecode(str(s), enc == null ? 'UTF-8' : String(enc)); } });
+  var Url = cls('URL', function (url) { return top.java.guardedUrl(String(url)); });
   // org.jsoup：Parser 只是个记号，parse 认出 xmlParser 就按 XML 解析
   function str(v) { return v == null ? '' : String(v); }
   function isParser(p) { return !!(p && p.__inkwellParser); }
@@ -215,8 +248,9 @@ class JdkCompat {
   var TxtNode = cls('TextNode', function (t) { return jdk.jsoupTextNode(str(t)); });
   var Elem = cls('Element', function (tag) { return jdk.jsoupElement(String(tag)); });
   var pkgs = {
-    java: { lang: { String: Str, Thread: Thr }, util: { Base64: B64, Arrays: Arr, zip: { Inflater: Infl } }, security: { MessageDigest: Md },
-      net: { URLEncoder: UrlEnc, URLDecoder: UrlDec } },
+    java: { lang: { String: Str, Thread: Thr }, util: { UUID: Uuid, Base64: B64, Arrays: Arr, zip: { Inflater: Infl, GZIPOutputStream: Gzos, GZIPInputStream: Gzis } }, security: { MessageDigest: Md, SecureRandom: Rng }, math: { BigInteger: BigInt },
+      io: { ByteArrayOutputStream: Bos, ByteArrayInputStream: Bis, InputStreamReader: Isr, BufferedReader: Br }, nio: { charset: { Charset: Charset } },
+      net: { URL: Url, URLEncoder: UrlEnc, URLDecoder: UrlDec } },
     javax: { crypto: { Cipher: Ciph, spec: { SecretKeySpec: Key, IvParameterSpec: Iv, GCMParameterSpec: Gcm } } },
     android: { util: { Base64: B64 } },
     org: { jsoup: { Jsoup: Jsp, Connection: Conn, nodes: { TextNode: TxtNode, Element: Elem }, parser: { Parser: Prs } } }

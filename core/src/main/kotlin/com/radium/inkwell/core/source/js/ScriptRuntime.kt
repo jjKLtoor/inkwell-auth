@@ -195,7 +195,10 @@ class RhinoScriptRuntime(
         val outermost = Context.getCurrentContext() == null
         val cx = factory.enterContext()
         try {
-            if (outermost) cx.putThreadLocal(KEY_COUNT, 0L)
+            if (outermost) {
+                cx.putThreadLocal(KEY_COUNT, 0L)
+                ScriptComputationBudget.reset()
+            }
             val proto = prototypeByThread.get() ?: cx.initSafeStandardObjects(null, true).also {
                 prototypeByThread.set(it)
             }

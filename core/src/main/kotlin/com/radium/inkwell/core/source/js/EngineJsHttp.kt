@@ -96,6 +96,17 @@ class EngineJsHttp(
             }
         }.getOrNull() ?: requests.map { null }
 
+    override fun fetchBinary(url: String, method: String, body: ByteArray?, headers: Map<String, String>, timeoutMs: Long): StrResponse? =
+        blockingUnderParent {
+            withTimeout(timeoutMs.coerceIn(1, 45_000)) {
+                // ISO-8859-1 是逐字节的往返载体；不经 UTF-8 重编码，不自动重发提交请求。
+                val page = http.fetch(url, method, body?.toString(Charsets.ISO_8859_1), headers,
+                    charsetOverride = "ISO-8859-1", throwOnHttpError = false, followRedirects = false,
+                    maxResponseBytes = SCRIPT_BUFFER_LIMIT.toLong(), retryTransientErrors = false)
+                StrResponse(page.bodyText, page.statusCode, page.finalUrl, page.headers)
+            }
+        }
+
     private suspend fun request(
         url: String,
         method: String,

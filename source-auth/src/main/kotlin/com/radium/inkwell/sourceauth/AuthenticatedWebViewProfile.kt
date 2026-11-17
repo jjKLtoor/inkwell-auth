@@ -39,7 +39,8 @@ class AuthenticatedWebViewProfile private constructor(
     private var original: List<okhttp3.Cookie> = emptyList()
     private var pendingWrites = 0
     private val proxyJob = SupervisorJob()
-    private val anonymous = SourceHttpClient(OkHttpClient.Builder().followSslRedirects(false).build())
+    // profile 是唯一 Cookie 所有者；代理不得缓存响应 Cookie，再覆盖 JS 写入或匿名资源的空 Cookie。
+    private val anonymous = SourceHttpClient(OkHttpClient.Builder().followSslRedirects(false).build(), useMemoryCookieJar = false)
     @Volatile private var closed = false
     @Volatile var failure: String? = null
         private set
@@ -94,7 +95,11 @@ class AuthenticatedWebViewProfile private constructor(
         val parsed = url.toHttpUrlOrNull()
         val destination = request.requestHeaders.entries.firstOrNull { it.key.equals("Sec-Fetch-Dest", true) }?.value
         if (parsed == null || !parsed.isHttps || parsed.username.isNotEmpty() || parsed.password.isNotEmpty() || isPrivateNetworkLiteral(parsed.host) ||
-            (request.method != "GET" && request.method != "HEAD") || (!approved && destination in setOf("iframe", "frame", "document", "font"))) return denied(if (approved) "隔离渲染暂不支持此网页请求方式" else null)
+            (request.method != "GET" && request.method != "HEAD") || (!approved && destination in setOf("iframe", "frame", "document", "font"))) {
+            // 拦截规则不变；统计上报等子请求失败不能把已经取得的主文档整体判为失败。
+            // 必需数据若因此缺失，仍由后续来源规则的匹配结果判定，不假定页面可用。
+            return denied(if (approved && request.isForMainFrame) "隔离渲染暂不支持此网页请求方式" else null)
+        }
         return try {
             // 明确移除协程身份，不复制 Cookie、Authorization 或来源自定义认证头，不记录资源完整地址。
             val page = runBlocking(proxyJob + SourceRequestSession.binding(null)) {
@@ -118,7 +123,7 @@ class AuthenticatedWebViewProfile private constructor(
                 }
                 response
             }
-            if (page.statusCode in 300..399) return denied(if (approved) "隔离渲染暂不支持服务器重定向，请核对来源页面地址" else null)
+            if (page.statusCode in 300..399) return denied(if (approved && request.isForMainFrame) "隔离渲染暂不支持服务器重定向，请核对来源页面地址" else null)
             val type = page.headers.entries.firstOrNull { it.key.equals("Content-Type", true) }?.value?.firstOrNull()?.substringBefore(';') ?: "text/plain"
             if (!(type.startsWith("text/") || type.contains("javascript") || type.contains("json") || type.contains("xml"))) return denied()
             val headers = page.headers.filterKeys { it.lowercase() !in setOf("set-cookie", "content-length", "content-encoding") }.mapValues { it.value.joinToString(",") }
@@ -128,7 +133,7 @@ class AuthenticatedWebViewProfile private constructor(
 
     fun blocksNavigation(request: WebResourceRequest): Boolean {
         if (closed || !session.active || !session.scope.permits(request.url.toString())) {
-            failure = "页面跳转超出来源认证范围"
+            if (request.isForMainFrame) failure = "页面跳转超出来源认证范围"
             return true
         }
         return false

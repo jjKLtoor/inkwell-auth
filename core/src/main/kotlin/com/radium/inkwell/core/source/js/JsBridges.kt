@@ -45,6 +45,10 @@ interface JsHttp {
     fun fetchAll(requests: List<JsHttpRequest>): List<StrResponse?> =
         requests.map { fetch(it.url, it.method, it.body, it.headers) }
 
+    /** 原始字节经受控 HTTP 出口传递；旧实现不能用字符串重编码假装支持二进制。 */
+    fun fetchBinary(url: String, method: String, body: ByteArray?, headers: Map<String, String>, timeoutMs: Long): StrResponse? =
+        throw UnsupportedOperationException("当前网络出口不支持二进制连接")
+
     fun cookieOf(url: String): String
     fun setCookie(url: String, cookie: String)
     fun removeCookie(url: String)
@@ -542,6 +546,8 @@ class JavaBridge(
     private var content: JsRuleQuery? = query
 
     // ---- 网络 ----
+
+    fun guardedUrl(url: String): GuardedUrlShim = GuardedUrlShim(http, url)
 
     /**
      * 与 Legado 一致：地址可自带 `,{'method':'POST','body':…,'headers':…}` 选项，
