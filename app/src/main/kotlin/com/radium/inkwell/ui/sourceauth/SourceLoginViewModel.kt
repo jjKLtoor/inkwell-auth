@@ -98,6 +98,41 @@ class SourceLoginViewModel(
     fun cancel() { mutableState.value = mutableState.value.copy(browsing = false, message = "已取消，之前保存的会话未修改") }
     fun fail(message: String) { mutableState.value = mutableState.value.copy(loaded = true, browsing = false, busy = false, message = message) }
 
+    fun refreshCookies() {
+        if (mutableState.value.busy || mutableState.value.browsing) return
+        val scope = mutableState.value.scope ?: return
+        mutableState.value = mutableState.value.copy(busy = true, message = "正在读取本地 Cookie…")
+        viewModelScope.launch {
+            try {
+                val saved = sessions.savedSnapshot(scope)
+                mutableState.value = mutableState.value.copy(busy = false, restored = saved, message = "本地 Cookie，登录状态未知")
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutableState.value = mutableState.value.copy(busy = false, message = "Cookie 无法读取，原会话未修改")
+            }
+        }
+    }
+
+    fun editCookie(cookie: okhttp3.Cookie, value: String?) {
+        if (mutableState.value.busy || mutableState.value.browsing) return
+        val scope = mutableState.value.scope ?: return
+        mutableState.value = mutableState.value.copy(busy = true, message = "正在保存 Cookie…")
+        viewModelScope.launch {
+            try {
+                val saved = sessions.editCookie(scope, cookie, value)
+                mutableState.value = mutableState.value.copy(busy = false, restored = saved,
+                    message = if (value == null) "Cookie 已删除，登录状态未知" else "Cookie 已更新，登录状态未知")
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutableState.value = mutableState.value.copy(busy = false, message = when (error) {
+                    is IllegalArgumentException -> "Cookie 值格式不正确，原会话未修改"
+                    is IllegalStateException -> "Cookie 已变化或过期，请刷新后重试"
+                    else -> "Cookie 保存失败，原会话未修改"
+                })
+            }
+        }
+    }
+
     fun save(session: CookieSession) {
         if (mutableState.value.busy) return
         val scope = mutableState.value.scope ?: return

@@ -34,7 +34,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 /**
  * 独立的短期 profile，不操作默认 CookieManager。平台原生 profile 在交互期间可能落盘，
  * 不宣称它被应用密钥加密；退出等待清理浏览数据，下次进程删除空 profile / 异常残留，且禁止系统备份。
- * 只收集已访问 URL 可见的完整 Cookie，localStorage 只在临时 profile 使用，不导出或跨进程恢复；额外 SSO / 第三方 Cookie 不自动放行。
+ * 只收集已访问 URL 可见的完整 Cookie，localStorage 只在临时 profile 使用，不导出或跨进程恢复；公网 HTTPS 跳转正常跟随，第三方 Cookie 仍关闭。
  */
 @SuppressLint("RequiresFeature", "SetJavaScriptEnabled")
 class LoginWebSession(
@@ -52,21 +52,9 @@ class LoginWebSession(
     private val navigation = LoginNavigationPolicy(scope)
     private val reportedBlocks = ConcurrentHashMap.newKeySet<String>()
     private fun blockedEvent(url: String, mainFrame: Boolean, kind: LoginResourceKind = loginResourceKind(url, mainFrame)) {
-        val origin = navigation.recordBlocked(url)
+        val origin = navigation.origin(url)
         if (reportedBlocks.size < 64 && reportedBlocks.add(origin.orEmpty() + mainFrame + kind)) event(LoginPageEvent.Blocked(origin, mainFrame, kind))
     }
-
-    /** 用户确认后在当前网页登录生效；记住许可仍须随会话显式保存，阅读认证边界不变。 */
-    suspend fun approveTemporaryOrigin(origin: String): Boolean {
-        val url = origin.toHttpUrlOrNull() ?: return false
-        if (withContext(Dispatchers.IO) { com.radium.inkwell.core.source.isPrivateNetworkHost(url.host) }) return false
-        return withContext(Dispatchers.Main) { !closed && navigation.approve(origin) }
-    }
-
-    fun approvedWebOrigins(): List<String> = navigation.approvedOrigins()
-
-    /** 由原生界面明确授权公开 HTTPS 子资源；不放行主页面跳转或修改阅读认证。 */
-    fun allowPublicResources(allowed: Boolean) { check(!closed); navigation.allowPublicResources = allowed }
 
     private val profileName: String
     private val visited = ConcurrentHashMap.newKeySet<String>()
@@ -156,7 +144,7 @@ class LoginWebSession(
         browser.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val url = request.url.toString()
-                if (closed || !navigation.permits(url, request.isForMainFrame)) { blockedEvent(url, request.isForMainFrame, loginResourceKind(url, request.isForMainFrame, request.requestHeaders)); return blocked() }
+                if (closed || !navigation.permits(url)) { blockedEvent(url, request.isForMainFrame, loginResourceKind(url, request.isForMainFrame, request.requestHeaders)); return blocked() }
                 if (visited.size < 256) visited.add(url)
                 return intercept(request).also { response ->
                     if (request.isForMainFrame && response != null && response.statusCode >= 400) pageFailure("网络保护阻止了登录页面，或页面返回 HTTP " + response.statusCode)
@@ -165,7 +153,7 @@ class LoginWebSession(
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 if (view === popup && request.url.toString() == "about:blank") return false
-                val denied = !navigation.permits(request.url.toString(), request.isForMainFrame)
+                val denied = !navigation.permits(request.url.toString())
                 if (denied) blockedEvent(request.url.toString(), request.isForMainFrame)
                 return denied
             }
@@ -223,14 +211,9 @@ class LoginWebSession(
         return false
     }
 
-    suspend fun start(url: String, restored: CookieSession?, allowResources: Boolean? = null) = withContext(Dispatchers.Main) {
+    suspend fun start(url: String, restored: CookieSession?) = withContext(Dispatchers.Main) {
         check(!closed && scope.permits(url))
-        if (allowResources != null || restored != null) navigation.allowPublicResources = allowResources ?: requireNotNull(restored).allowWebResources
         if (popup != null) closePopup()
-        restored?.webOrigins?.forEach { origin ->
-            val target = origin.toHttpUrlOrNull()
-            if (target != null && !withContext(Dispatchers.IO) { com.radium.inkwell.core.source.isPrivateNetworkHost(target.host) }) navigation.restore(origin)
-        }
         restored?.cookies?.forEach { cookie ->
             suspendCancellableCoroutine { continuation ->
                 pendingCookieWrites++
@@ -255,14 +238,14 @@ class LoginWebSession(
         view.loadUrl(url)
     }
 
-    suspend fun capture(rememberWebOrigins: Boolean = false): CookieSession = withContext(Dispatchers.Main) {
+    suspend fun capture(): CookieSession = withContext(Dispatchers.Main) {
         check(!closed)
         val records = visited.flatMap { url ->
             CookieManagerCompat.getCookieInfo(cookies, url).mapNotNull { parseWebViewCookie(url.toHttpUrl(), it) }
         }.distinctBy { "${it.name}\u0000${it.domain}\u0000${it.path}" }
         // 临时允许的网站可能持有自己的账号 Cookie，不能顺手导出到原来源的持久认证。
         CookieSession(records.filter { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } },
-            webOrigins = if (rememberWebOrigins) navigation.approvedOrigins() else emptyList(), allowWebResources = navigation.allowPublicResources)
+            allowWebResources = true)
     }
 
     /** 当前进程不能删除已加载的 profile，先销毁视图并等待其全部浏览数据清理完成。 */
@@ -271,7 +254,6 @@ class LoginWebSession(
         closed = true
         pendingDialog?.cancel(); pendingDialog = null; onDialog = null
         popup?.let { container.removeView(it); it.stopLoading(); it.destroy() }; popup = null
-        navigation.clear()
         reportedBlocks.clear()
         try {
             view.stopLoading()

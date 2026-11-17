@@ -28,7 +28,8 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    SourceLoginContent(state, onBack, viewModel::start, viewModel::cancel, viewModel::fail, viewModel::save, viewModel::logout, onSelectPage = viewModel::selectPage)
+    SourceLoginContent(state, onBack, viewModel::start, viewModel::cancel, viewModel::fail, viewModel::save, viewModel::logout,
+        onSelectPage = viewModel::selectPage, onRefreshCookies = viewModel::refreshCookies, onEditCookie = viewModel::editCookie)
 }
 
 @Composable
@@ -45,6 +46,8 @@ internal fun SourceLoginContent(
     },
     onDiagnosticEvent: (LoginPageEvent) -> Unit = {},
     onSelectPage: (String) -> Unit = {},
+    onRefreshCookies: () -> Unit = {},
+    onEditCookie: (okhttp3.Cookie, String?) -> Unit = { _, _ -> },
 ) {
     var session by remember { mutableStateOf<LoginWebSession?>(null) }
     val coroutineScope = rememberCoroutineScope()
@@ -57,14 +60,11 @@ internal fun SourceLoginContent(
     var busy by remember { mutableStateOf(false) }
     var timeout by remember { mutableStateOf<Job?>(null) }
     var pageMessage by remember { mutableStateOf("正在打开登录页…") }
-    var blocked by remember { mutableStateOf<List<LoginPageEvent.Blocked>>(emptyList()) }
-    var review by remember { mutableStateOf(false) }
-    var selectedSite by remember { mutableStateOf<String?>(null) }
-    var resourceAccess by remember(state.restored?.allowWebResources) { mutableStateOf(state.restored?.allowWebResources ?: true) }
-    var rememberSites by remember { mutableStateOf(true) }
+    var blockedResources by remember { mutableStateOf(false) }
     var webDialog by remember { mutableStateOf<LoginWebDialog?>(null) }
     var currentOrigin by remember { mutableStateOf("") }
     var showHelp by remember { mutableStateOf(false) }
+    var showCookies by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         try { LoginWebSession.cleanupOrphans(); supported = LoginWebSession.supported() }
@@ -92,6 +92,12 @@ internal fun SourceLoginContent(
         }
     }
 
+    if (showCookies) {
+        BackHandler { showCookies = false }
+        SourceCookieScreen(state, { showCookies = false }, onRefreshCookies, onEditCookie)
+        return
+    }
+
     AppScaffold(
         containerColor = pageColor,
         blurBars = !state.browsing,
@@ -116,13 +122,6 @@ internal fun SourceLoginContent(
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                 }
-                blocked.filter { it.origin != null }.minByOrNull { it.kind.priority }?.let { item ->
-                    Row(Modifier.fillMaxWidth().padding(horizontal = Dimens.listHorizontal), verticalAlignment = Alignment.CenterVertically) {
-                        Text(if (item.mainFrame) "登录需要跳转到其他站点" else "网页资源未完整加载", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1)
-                        AppTextButton(if (item.mainFrame) "选择登录站点" else "加载网页资源", enabled = !busy,
-                            onClick = { selectedSite = if (item.mainFrame) item.origin else null; review = true })
-                    }
-                }
                 AndroidView(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     factory = { context ->
@@ -135,22 +134,25 @@ internal fun SourceLoginContent(
                                     LoginPageEvent.Loading -> {
                                         visible = false
                                         pageFailed = false
+                                        blockedResources = false
                                         pageMessage = "正在加载登录页…"
                                         timeout?.cancel()
-                                        timeout = coroutineScope.launch { delay(30000); if (session === owned && !visible) pageMessage = "加载较慢，可重载或查看受限站点" }
+                                        timeout = coroutineScope.launch { delay(30000); if (session === owned && !visible) pageMessage = "加载较慢，请检查网络后重载" }
                                     }
                                     LoginPageEvent.Visible -> {
                                         timeout?.cancel(); visible = !pageFailed
-                                        if (!pageFailed) pageMessage = if (blocked.isEmpty()) "请在下方网页完成登录" else "部分网页内容受限，可核对所需站点"
+                                        if (!pageFailed) pageMessage = if (!blockedResources) "请在下方网页完成登录" else "部分资源不符合安全要求，已阻止加载"
                                     }
                                     is LoginPageEvent.Failed -> { timeout?.cancel(); pageFailed = true; visible = false; pageMessage = event.reason }
                                     is LoginPageEvent.Location -> currentOrigin = event.origin
                                     is LoginPageEvent.Notice -> pageMessage = event.message
                                     is LoginPageEvent.Blocked -> {
-                                        val old = blocked.firstOrNull { it.origin == event.origin }
-                                        if (old == null && blocked.size < 16) blocked = blocked + event
-                                        else if (old != null && event.kind.priority < old.kind.priority) blocked = blocked.map { if (it.origin == event.origin) event else it }
-                                        if (event.mainFrame) { timeout?.cancel(); pageMessage = "登录需要其他站点，请先核对" }
+                                        blockedResources = true
+                                        if (event.mainFrame) {
+                                            timeout?.cancel(); pageFailed = true; visible = false
+                                            pageMessage = "已阻止不安全的网页地址，请检查来源登录配置"
+                                        } else pageMessage = "部分资源不符合安全要求，已阻止加载"
+
                                     }
                                 }
                             }
@@ -159,7 +161,7 @@ internal fun SourceLoginContent(
                                 tag = owned
                                 post {
                                     if (session === owned) coroutineScope.launch {
-                                        try { owned.start(requireNotNull(state.page).url, state.restored, resourceAccess) }
+                                        try { owned.start(requireNotNull(state.page).url, state.restored) }
                                         catch (error: Exception) {
                                             if (error is CancellationException) throw error
                                             pageMessage = "登录页无法打开，请取消后重试"
@@ -172,7 +174,7 @@ internal fun SourceLoginContent(
                     onRelease = { released ->
                         val owned = released.tag as? LoginWebSession
                         try { owned?.close() } catch (_: Exception) { onError("网页登录清理失败，请重试") }
-                        if (session === owned) { timeout?.cancel(); session = null; visible = false; blocked = emptyList(); webDialog = null }
+                        if (session === owned) { timeout?.cancel(); session = null; visible = false; blockedResources = false; webDialog = null }
                     },
                 )
                 Row(
@@ -185,7 +187,7 @@ internal fun SourceLoginContent(
                             val owned = session ?: return@PrimaryButton
                             busy = true
                             coroutineScope.launch {
-                                try { onSave(owned.capture(rememberSites)) }
+                                try { onSave(owned.capture()) }
                                 catch (error: Exception) {
                                     if (error is CancellationException) throw error
                                     onError("会话读取或清理失败，请重试")
@@ -208,7 +210,7 @@ internal fun SourceLoginContent(
                         Text(state.message, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         state.scope?.originUrls?.forEach { Text(it, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary) }
                         PrimaryButton(if (state.restored == null) "登录" else "重新登录",
-                            onClick = { blocked = emptyList(); pageMessage = "正在打开登录页…"; onStart() },
+                            onClick = { blockedResources = false; pageMessage = "正在打开登录页…"; onStart() },
                             enabled = state.loaded && state.page != null && supported && !checking && !state.busy, modifier = Modifier.fillMaxWidth())
                     }
                 }
@@ -218,14 +220,14 @@ internal fun SourceLoginContent(
                     state.page?.home == true -> "未声明登录地址，仅尝试打开来源首页。"
                     state.page?.upgraded == true -> "旧地址仅尝试 HTTPS，不使用明文登录。"
                     state.page?.partial == true -> "仅打开规则中明确声明的网页，不执行表单按钮脚本。"
-                    else -> "请核对登录站点。账号密码在网站页面输入。"
+                    else -> "账号密码在网站页面输入，完成登录后保存会话。"
                 })
-                SettingGroup {
-                    SwitchRow("允许公开网页资源", "加载网页所需的 HTTPS 样式、脚本、图片和接口，保存会话后记住", resourceAccess, { allowed ->
-                        if (allowed) { selectedSite = null; review = true } else { resourceAccess = false; session?.allowPublicResources(false) }
-                    }, position = SettingGroupPosition.Alone)
-                }
                 SectionHeader("会话管理")
+                SettingGroup {
+                    SettingRow("已保存 Cookie", value = (state.restored?.cookies?.size ?: 0).toString(),
+                        onClick = if (state.loaded && state.scope != null && !state.busy) { { showCookies = true; onRefreshCookies() } } else null,
+                        position = SettingGroupPosition.Alone)
+                }
                 SettingGroup {
                     SettingRow("支持范围与隐私", onClick = { showHelp = true }, position = SettingGroupPosition.Alone)
                 }
@@ -245,47 +247,6 @@ internal fun SourceLoginContent(
     if (showHelp) AppAlertDialog(
         title = "网页登录", onDismissRequest = { showHelp = false }, confirmText = "知道了",
         onConfirm = { showHelp = false }, closeOnConfirm = true, dismissText = null,
-        text = "不保存密码，只保存可恢复的来源 Cookie。可一次允许公开 HTTPS 网页资源；跨站登录跳转单独确认，保存后复用所选入口、资源设置和明确记住的站点，仍检查私网。不会加入阅读请求的认证范围；第三方 Cookie 和无效证书仍受限制。退出登录会一并清除保存的许可。",
+        text = "不保存密码，只保存可恢复的来源 Cookie。网页及公开 HTTPS 跳转会自动加载，当前站点显示在网页上方。私网、无效证书和第三方 Cookie 仍受限制；网页登录的访问范围不会扩大阅读请求的认证范围。保存后恢复所选入口和 Cookie。",
     )
-    if (review) {
-        val origin = selectedSite
-        AppAlertDialog(
-            title = if (origin == null) "允许加载网页资源？" else "允许登录跳转？",
-            onDismissRequest = { if (!busy) review = false },
-            confirmText = if (origin == null) "允许加载资源" else "允许并继续", confirmLoading = busy, dismissEnabled = !busy,
-            content = {
-                if (origin == null) {
-                    Text("此来源的登录网页可以加载公开 HTTPS 脚本、样式、图片和接口，内容可以参与网页交互，并可能收到按域名匹配的网页 Cookie。保存会话后记住此设置。新主页面跳转仍需确认；私网、无效证书和阅读认证边界保持不变。", style = MiuixTheme.textStyles.footnote1)
-                } else {
-                    val sites = blocked.filter { it.mainFrame }.mapNotNull { it.origin }.distinct()
-                    if (sites.size > 1) SpinnerSettingRow("登录站点", sites.map { PickerOption(it, it.toHttpUrlOrNull()?.host.orEmpty()) }, origin, { selectedSite = it.id })
-                    Text(origin + "\n\n此网页可能收到按域名匹配的 Cookie，请确认它是你信任的登录站点。允许后重新加载所选入口，不重放已提交表单。", style = MiuixTheme.textStyles.footnote1)
-                    SwitchRow("记住此登录站点", "保存会话后生效，仅用于此来源的网页登录", rememberSites, { rememberSites = it }, enabled = !busy)
-                }
-            },
-            onConfirm = {
-                busy = true
-                coroutineScope.launch {
-                    try {
-                        if (origin == null) {
-                            resourceAccess = true
-                            session?.allowPublicResources(true)
-                            blocked = blocked.filter { it.mainFrame }
-                            review = false
-                            if (session != null) reload()
-                        } else {
-                            val approved = session?.approveTemporaryOrigin(origin) == true
-                            review = false
-                            if (approved) { blocked = blocked.filterNot { it.origin == origin }; reload() }
-                            else pageMessage = "站点未通过安全检查或超过许可上限，请核对后重试"
-                        }
-                    } catch (error: Exception) {
-                        if (error is CancellationException) throw error
-                        review = false
-                        pageMessage = "站点检查失败，请稍后重试"
-                    } finally { busy = false }
-                }
-            },
-        )
-    }
 }

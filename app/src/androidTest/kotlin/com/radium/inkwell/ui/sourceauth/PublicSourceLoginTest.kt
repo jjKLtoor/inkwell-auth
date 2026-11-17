@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-/** 仅显式传入快照才访问公开登录页；不填账号、不抓正文、不自动批准额外域名。 */
+/** 仅显式传入快照才访问公开登录页；不填账号、不抓正文；网页按当前策略自动跟随公开 HTTPS 跳转。 */
 class PublicSourceLoginTest {
     @Test fun 逐条记录已授权的公开页面访问结果而非登录成功() {
         val args = InstrumentationRegistry.getArguments()
@@ -33,7 +33,6 @@ class PublicSourceLoginTest {
         val inst = InstrumentationRegistry.getInstrumentation()
         val context = inst.targetContext
         val sourceFilter = args.getString("sourceFilter")?.split(",")?.toSet()
-        val approvedOrigins = args.getString("confirmOrigins")?.split(",")?.toSet().orEmpty()
         val rows = Json.parseToJsonElement(File(requireNotNull(snapshot)).readText()).jsonArray.filter {
             it.jsonObject["bookSourceGroup"]?.jsonPrimitive?.content.orEmpty().contains("大厂正版") &&
                 (sourceFilter == null || it.jsonObject["bookSourceName"]?.jsonPrimitive?.content in sourceFilter)
@@ -50,10 +49,8 @@ class PublicSourceLoginTest {
                 val events = ConcurrentLinkedQueue<LoginPageEvent>()
                 var owned: LoginWebSession? = null
                 var result = "NOT_SUPPORTED"
-                var confirmation = "NOT_ATTEMPTED"
+                val confirmation = "NOT_REQUIRED"
                 var dom = ""
-                val granted = mutableListOf<String>()
-                val priorEvents = mutableListOf<LoginPageEvent>()
                 try {
                     if (page != null && scope != null) {
                         val state = mutableStateOf(SourceLoginState(loaded = true, name = source.name, scope = scope, page = page, message = "未登录"))
@@ -74,28 +71,6 @@ class PublicSourceLoginTest {
                             while (android.os.SystemClock.elapsedRealtime() < deadline && events.none {
                                 it is LoginPageEvent.Visible || it is LoginPageEvent.Failed || it is LoginPageEvent.Blocked && it.mainFrame
                             }) Thread.sleep(100)
-                            val navigation = events.filterIsInstance<LoginPageEvent.Blocked>().firstOrNull { it.mainFrame && it.origin in approvedOrigins }
-                            val navigationOrigin = navigation?.origin
-                            if (navigationOrigin != null) {
-                                confirmation = "REVIEW_MISSING"
-                                val review = device.wait(Until.findObject(By.text("选择登录站点")), 5000)
-                                if (review != null) {
-                                    review.click()
-                                    confirmation = "DIALOG_NOT_READY"
-                                    val dialog = device.wait(Until.findObject(By.textContains(navigationOrigin)), 5000)
-                                    val allow = device.wait(Until.findObject(By.text("允许并继续")), 5000)
-                                    if (dialog != null && allow != null) {
-                                        priorEvents.addAll(events); events.clear()
-                                        allow.click()
-                                        confirmation = "CONFIRMED"
-                                        granted.add(navigationOrigin)
-                                        val secondDeadline = android.os.SystemClock.elapsedRealtime() + 20000
-                                        while (android.os.SystemClock.elapsedRealtime() < secondDeadline && events.none {
-                                            it is LoginPageEvent.Visible || it is LoginPageEvent.Failed || it is LoginPageEvent.Blocked && it.mainFrame
-                                        }) Thread.sleep(100)
-                                    }
-                                }
-                            }
                             Thread.sleep(2000)
                             device.takeScreenshot(File(context.getExternalFilesDir(null), "public-confirm-" + results.size + ".png"))
                             result = when {
@@ -118,9 +93,9 @@ class PublicSourceLoginTest {
                     put("name", source.name); put("source", source.id); put("public_page", result)
                     put("dom_diagnostic", dom)
                     put("confirmation_step", confirmation)
-                    put("confirmed_origins", JsonArray(granted.map(::JsonPrimitive)))
+                    put("confirmed_origins", JsonArray(emptyList()))
                     put("errors", JsonArray(events.filterIsInstance<LoginPageEvent.Failed>().map { JsonPrimitive(it.reason) }))
-                    put("blocked_origins", JsonArray((priorEvents + events).filterIsInstance<LoginPageEvent.Blocked>().mapNotNull { it.origin }.distinct().map(::JsonPrimitive)))
+                    put("blocked_origins", JsonArray(events.filterIsInstance<LoginPageEvent.Blocked>().mapNotNull { it.origin }.distinct().map(::JsonPrimitive)))
                     put("login", "NOT_TESTED"); put("search", "NOT_TESTED"); put("toc", "NOT_TESTED"); put("content", "NOT_TESTED")
                 })
                 // 每站只加载一次，不重试 403、不自动点登录或购买按钮。

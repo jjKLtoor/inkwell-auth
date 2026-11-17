@@ -10,7 +10,7 @@ import java.util.Collections
 class CookieSession(cookies: List<Cookie>, loginData: Map<String, String> = emptyMap(), webOrigins: List<String> = emptyList(), val allowWebResources: Boolean = false, val loginPageUrl: String? = null) {
     val loginData: Map<String, String> = Collections.unmodifiableMap(LinkedHashMap(loginData))
     val cookies: List<Cookie> = Collections.unmodifiableList(cookies.toList())
-    /** 用户明确选择记住的网页登录站点；绝不加入阅读引擎的认证作用域。 */
+    /** 旧版 v4 密文兼容字段，现已不参与网页加载决策；绝不加入阅读引擎的认证作用域。 */
     val webOrigins: List<String> = Collections.unmodifiableList(webOrigins.distinct())
     override fun toString(): String = "CookieSession(redacted)"
 }

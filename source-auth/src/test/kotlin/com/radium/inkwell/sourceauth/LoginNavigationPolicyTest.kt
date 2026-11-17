@@ -4,49 +4,38 @@ import com.radium.inkwell.core.source.auth.SourceAuthScope
 import kotlin.test.*
 
 class LoginNavigationPolicyTest {
-    @Test fun 公开资源模式只允许HTTPS子资源且不放行登录跳转或私网() {
-        val policy = LoginNavigationPolicy(scope)
-        assertFalse(policy.permits("https://cdn.example.test/a.js", false))
-        policy.allowPublicResources = true
-        assertTrue(policy.permits("https://cdn.example.test/a.js", false))
-        assertFalse(policy.permits("https://cdn.example.test/login", true))
-        listOf("http://cdn.example.test/a.js", "https://127.0.0.1/a.js", "https://192.168.1.1/", "https://user:pass@example.test/").forEach {
-            assertFalse(policy.permits(it, false))
-        }
-        assertFalse(scope.permits("https://cdn.example.test/"))
-        policy.clear()
-        assertFalse(policy.permits("https://cdn.example.test/a.js", false))
-    }
-
     private val scope = requireNotNull(SourceAuthScope.create("fixture", "https://example.com/"))
 
-    @Test fun 识别样式和脚本并优先提示缺失样式而非图片() {
-        assertEquals(LoginResourceKind.STYLE, loginResourceKind("https://cdn.example.test/a.css?token=redacted", false))
-        assertEquals(LoginResourceKind.STYLE, loginResourceKind("https://cdn.example.test/bundle", false, mapOf("Sec-Fetch-Dest" to "style")))
-        assertEquals(LoginResourceKind.SCRIPT, loginResourceKind("https://cdn.example.test/a.js", false))
-        assertEquals(LoginResourceKind.NAVIGATION, loginResourceKind("https://example.test/", true))
-        assertTrue(LoginResourceKind.STYLE.priority < LoginResourceKind.IMAGE.priority)
-    }
-
-    @Test fun 仅可逐个批准已拦截的精确HTTPS站点且不改变认证scope() {
+    @Test fun 公开HTTPS网页和资源自动加载但不扩展引擎认证范围() {
         val policy = LoginNavigationPolicy(scope)
-        assertFalse(policy.approve("https://cdn.example.test/"))
-        assertEquals("https://cdn.example.test/", policy.recordBlocked("https://cdn.example.test/a.js?token=redacted"))
-        assertFalse(policy.permits("https://cdn.example.test/a.js"))
-        assertTrue(policy.approve("https://cdn.example.test/"))
-        assertTrue(policy.permits("https://cdn.example.test/next"))
-        assertFalse(policy.permits("https://cdn.example.test:444/next"))
-        assertFalse(scope.permits("https://cdn.example.test/"))
-        policy.clear()
-        assertFalse(policy.permits("https://cdn.example.test/next"))
-        assertFalse(LoginNavigationPolicy(scope).permits("https://cdn.example.test/next"))
+        listOf("https://cdn.example.test/a.js", "https://login.example.test/member", "https://login.example.test:444/member").forEach {
+            assertTrue(policy.permits(it))
+            assertFalse(scope.permits(it))
+        }
+        assertTrue(scope.permits("https://example.com/member"))
     }
 
-    @Test fun 私网明文危险协议和含用户信息的地址不能临时批准() {
+    @Test fun 明文私网危险协议及含用户信息的地址不允许自动访问() {
         val policy = LoginNavigationPolicy(scope)
         listOf("http://example.test/", "https://localhost/", "https://127.0.0.1/", "https://192.168.1.2/", "file:///tmp/a", "https://user:pass@example.test/").forEach {
-            assertNull(policy.recordBlocked(it))
-            assertFalse(policy.approve(it))
+            assertFalse(policy.permits(it))
+            assertNull(policy.origin(it))
+            assertFalse(policy.restore(it))
         }
+        assertEquals("https://example.test/", policy.origin("https://example.test/login?token=fixture"))
+    }
+
+    @Test fun 旧版保存字段仅校验格式不再控制当前访问() {
+        val policy = LoginNavigationPolicy(scope)
+        assertTrue(policy.restore("https://old.example.test/"))
+        assertFalse(policy.restore("https://old.example.test/path?token=fixture"))
+        assertTrue(policy.permits("https://new.example.test/login"))
+        assertFalse(scope.permits("https://old.example.test/"))
+    }
+
+    @Test fun 识别样式和脚本并避免把完整URL作为诊断信息() {
+        assertEquals(LoginResourceKind.STYLE, loginResourceKind("https://cdn.example.test/a.css?token=redacted", false))
+        assertEquals(LoginResourceKind.SCRIPT, loginResourceKind("https://cdn.example.test/a.js", false))
+        assertEquals(LoginResourceKind.NAVIGATION, loginResourceKind("https://example.test/", true))
     }
 }

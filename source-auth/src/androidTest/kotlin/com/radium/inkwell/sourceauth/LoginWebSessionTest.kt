@@ -20,7 +20,7 @@ import org.junit.runner.RunWith
 /** 使用实际 Chromium profile 和完整 Cookie API；只做本地夹具，不访问真实账号或网站。 */
 @RunWith(AndroidJUnit4::class)
 class LoginWebSessionTest {
-    @Test fun 临时站点自己的Cookie不导出且关闭后清理() = runBlocking {
+    @Test fun 跨站页面自动加载但额外站点自己的Cookie不导出且关闭后清理() = runBlocking {
         withContext(Dispatchers.Main) {
             assumeTrue(LoginWebSession.supported())
             val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -36,13 +36,9 @@ class LoginWebSessionTest {
             try {
                 session.view.loadUrl(extra)
                 kotlinx.coroutines.withTimeout(10000) {
-                    while (events.none { it is LoginPageEvent.Blocked && it.origin == extra }) kotlinx.coroutines.delay(100)
-                }
-                assertTrue(session.approveTemporaryOrigin(extra))
-                session.view.loadUrl(extra)
-                kotlinx.coroutines.withTimeout(10000) {
                     while (CookieManagerCompat.getCookieInfo(profile.cookieManager, extra).none { it.startsWith("third=") }) kotlinx.coroutines.delay(100)
                 }
+                assertTrue(events.none { it is LoginPageEvent.Blocked })
                 assertTrue(session.capture().cookies.none { it.name == "third" })
                 assertFalse(scope.permits(extra))
                 session.close().await()
@@ -51,7 +47,7 @@ class LoginWebSessionTest {
         }
     }
 
-    @Test fun 主页面HTTP错误与额外站点跳转均提供明确事件() = runBlocking {
+    @Test fun 主页面HTTP错误与危险私网跳转均提供明确事件() = runBlocking {
         withContext(Dispatchers.Main) {
             assumeTrue(LoginWebSession.supported())
             val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -59,7 +55,7 @@ class LoginWebSessionTest {
             val events = java.util.concurrent.ConcurrentLinkedQueue<LoginPageEvent>()
             val session = LoginWebSession(context, scope, { request ->
                 if (request.url.path == "/error") android.webkit.WebResourceResponse("text/html", "UTF-8", 503, "Unavailable", emptyMap(), java.io.ByteArrayInputStream("fixture error".toByteArray()))
-                else android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream("<html><script>location.href='https://outside.invalid/member?token=fixture-secret'</script></html>".toByteArray()))
+                else android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream("<html><script>location.href='https://127.0.0.1/member?token=fixture-secret'</script></html>".toByteArray()))
             }, {})
             session.onPageEvent = { events.add(it) }
             try {
@@ -72,7 +68,7 @@ class LoginWebSessionTest {
                     while (events.none { it is LoginPageEvent.Blocked && it.mainFrame }) kotlinx.coroutines.delay(100)
                 }
                 val blocked = events.filterIsInstance<LoginPageEvent.Blocked>().first()
-                assertEquals("https://outside.invalid/", blocked.origin)
+                assertEquals(null, blocked.origin)
                 assertFalse(events.toString().contains("fixture-secret"))
             } finally { session.close().await() }
         }

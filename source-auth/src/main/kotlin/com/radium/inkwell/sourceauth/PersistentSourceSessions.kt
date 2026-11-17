@@ -5,6 +5,8 @@ import com.radium.inkwell.core.source.auth.SourceRequestSession
 import com.radium.inkwell.core.source.auth.SourceSessionProvider
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.HttpUrl
 import java.util.concurrent.ConcurrentHashMap
@@ -43,6 +45,59 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
         store.clear(scope)
     }
 
+    suspend fun savedSnapshot(scope: SourceAuthScope): CookieSession? = mutex.withLock {
+        val saved = sessions[scope]?.snapshot()?.let(::persistentSnapshot) ?: store.load(scope)
+        saved?.takeIf { it.cookies.isNotEmpty() || it.loginData.isNotEmpty() }
+    }
+
+    /** 编辑只改选中 Cookie 的值或删除该条，原属性、其他 Cookie 与认证 Header 保持原样。 */
+    suspend fun editCookie(scope: SourceAuthScope, expected: Cookie, value: String?): CookieSession? = withContext(NonCancellable) { mutex.withLock {
+        val old = sessions[scope]
+        // 先校验，失败不撤销现有会话；冻结后迟到的网络响应不能把旧值写回。
+        val plan = old?.beginEdit(expected, value) ?: (store.load(scope) ?: error("没有可编辑的会话")).let {
+            CookieEdit(it, changedCookie(it, expected, value))
+        }
+        val changed = plan.after
+        val saved = persistentSnapshot(changed)
+        try {
+            if (saved.cookies.isEmpty() && saved.loginData.isEmpty()) store.clear(scope) else store.save(scope, saved)
+            sessions[scope] = Session(scope, changed)
+            saved.takeIf { it.cookies.isNotEmpty() || it.loginData.isNotEmpty() }
+        } catch (error: Exception) {
+            // 原子写失败保留旧密文，并恢复编辑前的内存快照；旧请求引用仍保持撤销。
+            if (old != null) sessions[scope] = Session(scope, plan.before)
+            throw error
+        }
+    } }
+
+    private class CookieEdit(val before: CookieSession, val after: CookieSession)
+
+    private fun persistentSnapshot(value: CookieSession) = CookieSession(
+        value.cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() },
+        value.loginData.filterKeys { it == "\$loginHeader" }, value.webOrigins, value.allowWebResources, value.loginPageUrl,
+    )
+
+    private fun changedCookie(session: CookieSession, expected: Cookie, value: String?): CookieSession {
+        require(value == null || value.length <= 8192 && validCookieValue(value)) { "Cookie 值格式不正确" }
+        val current = session.cookies.firstOrNull { it.name == expected.name && it.domain == expected.domain && it.path == expected.path }
+        check(current != null && current.value == expected.value && current.expiresAt > System.currentTimeMillis()) { "Cookie 已变化，请刷新后重试" }
+        val replacement = value?.let {
+            Cookie.Builder().name(current.name).value(it).path(current.path).apply {
+                if (current.hostOnly) hostOnlyDomain(current.domain) else domain(current.domain)
+                if (current.persistent) expiresAt(current.expiresAt)
+                if (current.secure) secure()
+                if (current.httpOnly) httpOnly()
+            }.build()
+        }
+        return CookieSession(session.cookies.mapNotNull { if (it === current) replacement else it },
+            session.loginData, session.webOrigins, session.allowWebResources, session.loginPageUrl)
+    }
+
+    private fun validCookieValue(value: String): Boolean {
+        val body = if (value.length >= 2 && value.first() == '"' && value.last() == '"') value.substring(1, value.lastIndex) else value
+        return body.all { it == '!' || it in '#'..'+' || it in '-'..':' || it in '<'..'[' || it in ']'..'~' }
+    }
+
     private inner class Session(override val scope: SourceAuthScope, initial: CookieSession, private val readable: Boolean = true) : SourceRequestSession {
         @Volatile override var active = true
             private set
@@ -65,6 +120,15 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
         }
 
         @Synchronized fun revoke() { active = false; jar.clear(); loginData.clear() }
+
+        @Synchronized fun snapshot() = CookieSession(jar.snapshot(), loginData.toMap(), webOrigins, allowWebResources, loginPageUrl)
+
+        @Synchronized fun beginEdit(expected: Cookie, value: String?): CookieEdit {
+            val before = snapshot()
+            val result = CookieEdit(before, changedCookie(before, expected, value))
+            revoke()
+            return result
+        }
 
         override suspend fun flush() = mutex.withLock {
             if (!readable || !active || sessions[scope] !== this) return@withLock

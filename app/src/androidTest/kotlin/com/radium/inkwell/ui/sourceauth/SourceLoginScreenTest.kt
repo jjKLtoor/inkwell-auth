@@ -52,14 +52,14 @@ class SourceLoginScreenTest {
         val activity = inst.startActivitySync(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) as MainActivity
         val scope = requireNotNull(SourceAuthScope.create("restore-ui", "https://example.com/"))
         val cookie = requireNotNull(okhttp3.Cookie.parse(okhttp3.HttpUrl.Companion.run { "https://example.com/".toHttpUrl() }, "sid=fixture; Secure; Path=/; Max-Age=3600"))
-        val restored = com.radium.inkwell.sourceauth.CookieSession(listOf(cookie), webOrigins = listOf("https://cdn.example.test/"), allowWebResources = true)
+        val restored = com.radium.inkwell.sourceauth.CookieSession(listOf(cookie), webOrigins = listOf("https://cdn.example.test/"), allowWebResources = false)
         val state = mutableStateOf(SourceLoginState(loaded = true, scope = scope, page = LoginConfiguration.WebPage("https://example.com/login"), browsing = true, restored = restored))
         val saved = AtomicInteger()
         try {
             inst.runOnMainSync {
                 activity.setContent { InkwellTheme {
                     SourceLoginContent(state.value, {}, {}, { state.value = state.value.copy(browsing = false) }, { fail(it) },
-                        { assertEquals(listOf("https://cdn.example.test/"), it.webOrigins); assertTrue(it.allowWebResources); saved.incrementAndGet(); state.value = state.value.copy(message = "会话已保存，登录状态未知") }, {},
+                        { assertTrue(it.webOrigins.isEmpty()); assertTrue(it.allowWebResources); saved.incrementAndGet(); state.value = state.value.copy(message = "会话已保存，登录状态未知") }, {},
                         sessionFactory = { ctx, auth, error -> LoginWebSession(ctx, auth, { request ->
                             val body = if (request.url.host == "cdn.example.test") "document.getElementById('permit').innerText='站点许可已恢复';"
                                 else if (request.url.path == "/popup") "<html><meta name='viewport' content='width=device-width,initial-scale=1'><body>受控登录子窗口<button onclick='window.close()'>关闭子窗口</button></body></html>"
@@ -89,21 +89,24 @@ class SourceLoginScreenTest {
     }
 
     @Test fun 点击登录后实际加载网页且WebView有可见尺寸() = checkPage(false)
-    @Test fun 额外网页资源先拦截经原生确认后登录内容可见() = checkPage(true)
+    @Test fun 登录脚本自动加载无需手动确认() = checkPage(true)
 
-    @Test fun 样式资源受限经确认后正确显示登录内容() = checkPage(true, true)
+    @Test fun 样式资源自动加载后正确显示登录内容() = checkPage(true, true)
 
-    @Test fun 一次允许网页资源后多个域名无需逐个确认且只重载一次() = checkPage(true, true, true)
+    @Test fun 多个资源域名无需确认且不重复加载主页面() = checkPage(true, true, true)
 
-    @Test fun 额外主页面跳转仍须单独确认() = checkPage(true, redirect = true)
+    @Test fun 公网HTTPS登录跳转自动跟随无需选择站点() = checkPage(true, redirect = true)
 
-    private fun checkPage(dependency: Boolean, stylesheet: Boolean = false, batch: Boolean = false, redirect: Boolean = false) {
+    @Test fun 旧会话关闭资源的设置不再阻断当前网页() = checkPage(true, true, true, legacy = true)
+
+    private fun checkPage(dependency: Boolean, stylesheet: Boolean = false, batch: Boolean = false, redirect: Boolean = false, legacy: Boolean = false) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         instrumentation.runOnMainSync { assumeTrue(LoginWebSession.supported()) }
         val context = instrumentation.targetContext
         val activity = instrumentation.startActivitySync(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) as MainActivity
         val scope = requireNotNull(SourceAuthScope.create("ui-fixture", "https://example.com/"))
-        val state = mutableStateOf(SourceLoginState(loaded = true, scope = scope, page = LoginConfiguration.WebPage("https://example.com/login"), message = "未登录"))
+        val state = mutableStateOf(SourceLoginState(loaded = true, scope = scope, page = LoginConfiguration.WebPage("https://example.com/login"), message = "未登录",
+            restored = if (legacy) com.radium.inkwell.sourceauth.CookieSession(emptyList(), allowWebResources = false) else null))
         val requests = AtomicInteger()
         val mainRequests = AtomicInteger()
         var web: android.webkit.WebView? = null
@@ -127,7 +130,7 @@ class SourceLoginScreenTest {
                                         else if (stylesheet) "<html><meta name='viewport' content='width=device-width,initial-scale=1'><style>#login{display:none}</style><link rel='stylesheet' href='https://cdn.example.test/app.css'>${if (batch) "<script src='https://script.example.test/app.js'></script>" else ""}<body><div id='waiting'>等待页面资源</div><div id='login'>受控登录页面</div></body></html>"
                                         else if (dependency) "<html><meta name='viewport' content='width=device-width,initial-scale=1'><body><div id='login'>等待页面资源</div><script src='https://cdn.example.test/app.js'></script></body></html>"
                                         else "<html><body>受控登录页面</body></html>"
-                                    WebResourceResponse(if (script && stylesheet) "text/css" else if (script) "application/javascript" else "text/html", "UTF-8", ByteArrayInputStream(body.toByteArray()))
+                                    WebResourceResponse(if (request.url.host == "script.example.test") "application/javascript" else if (script && stylesheet) "text/css" else if (script) "application/javascript" else "text/html", "UTF-8", ByteArrayInputStream(body.toByteArray()))
                                 }, onError).also { web = it.view }
                             },
                         )
@@ -135,38 +138,18 @@ class SourceLoginScreenTest {
                 }
             }
             val device = UiDevice.getInstance(instrumentation)
-            if (dependency) {
-                val resources = device.wait(Until.findObject(By.text("允许公开网页资源")), 10000)
-                if (resources == null) androidx.test.uiautomator.UiScrollable(androidx.test.uiautomator.UiSelector().scrollable(true)).scrollTextIntoView("允许公开网页资源")
-                val setting = device.findObject(By.text("允许公开网页资源"))
-                assertNotNull(setting)
-                setting.click() // 仅为验证关闭后的提示与一次恢复，正常默认允许。
-                if (resources == null) {
-                    androidx.test.uiautomator.UiScrollable(androidx.test.uiautomator.UiSelector().scrollable(true)).scrollToBeginning(3)
-                    device.waitForIdle()
-                }
-            }
-            val login = device.wait(Until.findObject(By.text("登录")), 10000)
+            val login = device.wait(Until.findObject(By.text(if (legacy) "重新登录" else "登录")), 10000)
             assertNotNull("登录按钮未出现", login)
             device.takeScreenshot(java.io.File(context.getExternalFilesDir(null), "loginui-before.png"))
             login.click()
             val deadline = android.os.SystemClock.elapsedRealtime() + 10000
             while (requests.get() == 0 && android.os.SystemClock.elapsedRealtime() < deadline) Thread.sleep(100)
             assertTrue("点击后没有加载网页", requests.get() > 0)
-            if (dependency) {
-                assertTrue(device.wait(Until.hasObject(By.text("等待页面资源")), 10000))
-                if (stylesheet) assertTrue(device.hasObject(By.text("网页资源未完整加载")))
-                val review = device.wait(Until.findObject(By.text(if (redirect) "选择登录站点" else "加载网页资源")), 10000)
-                assertNotNull("应提供统一资源设置，不逐域名选择", review)
-                review.click()
-                device.takeScreenshot(java.io.File(context.getExternalFilesDir(null), "loginui-resources.png"))
-                val allow = device.wait(Until.findObject(By.text(if (redirect) "允许并继续" else "允许加载资源")), 10000)
-                assertNotNull(allow)
-                allow.click()
-            }
             assertTrue("网页内容必须实际可见", device.wait(Until.hasObject(By.text("受控登录页面")), 10000))
             device.takeScreenshot(java.io.File(context.getExternalFilesDir(null), "loginui-after.png"))
-            if (batch) assertEquals("一次资源确认只应重载一次", 2, mainRequests.get())
+            assertEquals("网页跳转与资源加载不能靠手动确认触发重载", if (redirect) 2 else 1, mainRequests.get())
+            assertFalse(device.hasObject(By.text("选择登录站点")))
+            assertFalse(device.hasObject(By.text("加载网页资源")))
             instrumentation.runOnMainSync { assertTrue("WebView 高度必须大于零", requireNotNull(web).height > 0)
                 assertTrue(requireNotNull(web).settings.useWideViewPort)
                 assertTrue(requireNotNull(web).settings.loadWithOverviewMode) }
