@@ -7,9 +7,11 @@ import okhttp3.HttpUrl
 import java.util.Collections
 
 /** 保留 Cookie 元数据，不把会话简化为无作用域字符串。没有任何自动 VERIFIED 判断。 */
-class CookieSession(cookies: List<Cookie>, loginData: Map<String, String> = emptyMap()) {
+class CookieSession(cookies: List<Cookie>, loginData: Map<String, String> = emptyMap(), webOrigins: List<String> = emptyList(), val allowWebResources: Boolean = false, val loginPageUrl: String? = null) {
     val loginData: Map<String, String> = Collections.unmodifiableMap(LinkedHashMap(loginData))
     val cookies: List<Cookie> = Collections.unmodifiableList(cookies.toList())
+    /** 用户明确选择记住的网页登录站点；绝不加入阅读引擎的认证作用域。 */
+    val webOrigins: List<String> = Collections.unmodifiableList(webOrigins.distinct())
     override fun toString(): String = "CookieSession(redacted)"
 }
 

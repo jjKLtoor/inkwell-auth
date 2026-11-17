@@ -47,6 +47,9 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
         @Volatile override var active = true
             private set
         private val jar = SessionCookieJar(scope, initial)
+        private val webOrigins = initial.webOrigins
+        private val allowWebResources = initial.allowWebResources
+        private val loginPageUrl = initial.loginPageUrl
         override val loginData: MutableMap<String, String> = ConcurrentHashMap(initial.loginData)
         override val hasCredentials: Boolean
             get() = active && (loginData.isNotEmpty() || jar.snapshot().any { it.expiresAt > System.currentTimeMillis() })
@@ -66,7 +69,7 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
         override suspend fun flush() = mutex.withLock {
             if (!readable || !active || sessions[scope] !== this) return@withLock
             // 登录信息可能含密码，只在内存使用；仅持久化认证 Header 与持久 Cookie。
-            val snapshot = CookieSession(jar.snapshot(), loginData.filterKeys { it == "\$loginHeader" })
+            val snapshot = CookieSession(jar.snapshot(), loginData.filterKeys { it == "\$loginHeader" }, webOrigins, allowWebResources, loginPageUrl)
             val next = fingerprint(snapshot)
             if (next != persisted) {
                 try {

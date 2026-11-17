@@ -30,9 +30,16 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
             require(cookies.size <= 256 && session.loginData.size <= 2)
             require(cookies.isNotEmpty() || session.loginData.isNotEmpty())
             require(cookies.all { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } })
+            require(session.webOrigins.size <= 8)
+            val policy = LoginNavigationPolicy(scope)
+            require(session.webOrigins.all(policy::restore))
+            session.loginPageUrl?.let { value ->
+                val page = value.toHttpUrl()
+                require(scope.permits(value) && page.username.isEmpty() && page.password.isEmpty())
+            }
             val plain = ByteArrayOutputStream().use { bytes ->
                 DataOutputStream(bytes).use { out ->
-                    out.writeInt(3)
+                    out.writeInt(4)
                     out.writeInt(cookies.size)
                     cookies.forEach {
                         out.writeUTF(it.toString())
@@ -40,6 +47,10 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
                     }
                     out.writeInt(session.loginData.size)
                     session.loginData.forEach { (key, value) -> out.writeUTF(key); out.writeUTF(value) }
+                    out.writeInt(session.webOrigins.size)
+                    session.webOrigins.forEach(out::writeUTF)
+                    out.writeBoolean(session.allowWebResources)
+                    out.writeUTF(session.loginPageUrl.orEmpty())
                 }
                 bytes.toByteArray()
             }
@@ -65,7 +76,7 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
             try {
                 DataInputStream(ByteArrayInputStream(plain)).use { input ->
                     val version = input.readInt()
-                    require(version in 1..3)
+                    require(version in 1..4)
                     val count = input.readInt()
                     require(count in 0..256)
                     val cookies = List(count) {
@@ -78,8 +89,19 @@ class EncryptedSessionStore(private val root: File, private val cipher: SessionC
                         require(size in 0..2)
                         buildMap { repeat(size) { put(input.readUTF(), input.readUTF()) } }
                     } else emptyMap()
+                    val origins = if (version >= 4) {
+                        val size = input.readInt()
+                        require(size in 0..8)
+                        val policy = LoginNavigationPolicy(scope)
+                        List(size) { input.readUTF().also { require(policy.restore(it)) } }
+                    } else emptyList()
+                    val allowResources = version >= 4 && input.readBoolean()
+                    val loginPage = if (version >= 4) input.readUTF().takeIf { it.isNotEmpty() }?.also { value ->
+                        val page = value.toHttpUrl()
+                        require(scope.permits(value) && page.username.isEmpty() && page.password.isEmpty())
+                    } else null
                     require(input.available() == 0)
-                    CookieSession(cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() }, data)
+                    CookieSession(cookies.filter { it.persistent && it.expiresAt > System.currentTimeMillis() }, data, origins, allowResources, loginPage)
                 }
             } finally { plain.fill(0) }
         }

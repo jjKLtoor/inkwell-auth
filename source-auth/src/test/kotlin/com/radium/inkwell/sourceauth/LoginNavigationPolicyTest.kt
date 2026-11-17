@@ -4,6 +4,20 @@ import com.radium.inkwell.core.source.auth.SourceAuthScope
 import kotlin.test.*
 
 class LoginNavigationPolicyTest {
+    @Test fun 公开资源模式只允许HTTPS子资源且不放行登录跳转或私网() {
+        val policy = LoginNavigationPolicy(scope)
+        assertFalse(policy.permits("https://cdn.example.test/a.js", false))
+        policy.allowPublicResources = true
+        assertTrue(policy.permits("https://cdn.example.test/a.js", false))
+        assertFalse(policy.permits("https://cdn.example.test/login", true))
+        listOf("http://cdn.example.test/a.js", "https://127.0.0.1/a.js", "https://192.168.1.1/", "https://user:pass@example.test/").forEach {
+            assertFalse(policy.permits(it, false))
+        }
+        assertFalse(scope.permits("https://cdn.example.test/"))
+        policy.clear()
+        assertFalse(policy.permits("https://cdn.example.test/a.js", false))
+    }
+
     private val scope = requireNotNull(SourceAuthScope.create("fixture", "https://example.com/"))
 
     @Test fun 识别样式和脚本并优先提示缺失样式而非图片() {

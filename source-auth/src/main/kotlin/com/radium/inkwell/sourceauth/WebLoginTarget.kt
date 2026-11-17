@@ -17,31 +17,34 @@ import java.net.URI
 /** 仅提取声明的网页，不执行登录脚本、表单按钮或购买操作。 */
 class WebLoginTarget(val url: String, val partial: Boolean, val upgraded: Boolean = false, val home: Boolean = false)
 
-private class ParsedTarget(val rule: BookSourceRule, val target: WebLoginTarget?)
+private class ParsedTarget(val rule: BookSourceRule, val targets: List<WebLoginTarget>)
 private val parsedTargets = java.util.concurrent.ConcurrentHashMap<String, ParsedTarget>()
 
-fun webLoginTarget(source: BookSourceRule): WebLoginTarget? {
+fun webLoginTarget(source: BookSourceRule): WebLoginTarget? = webLoginTargets(source).firstOrNull()
+
+/** 仅列出规则明确声明的静态入口，不把资源域名当作登录网页。 */
+fun webLoginTargets(source: BookSourceRule): List<WebLoginTarget> {
     parsedTargets[source.id]?.takeIf {
         it.rule.baseUrl == source.baseUrl && it.rule.loginUrl == source.loginUrl && it.rule.loginUi == source.loginUi
-    }?.let { return it.target }
-    val target = parseWebLoginTarget(source)
+    }?.let { return it.targets }
+    val target = parseWebLoginTargets(source)
     if (parsedTargets.size >= 256) parsedTargets.clear()
     parsedTargets[source.id] = ParsedTarget(source, target)
     return target
 }
 
-private fun parseWebLoginTarget(source: BookSourceRule): WebLoginTarget? {
+private fun parseWebLoginTargets(source: BookSourceRule): List<WebLoginTarget> {
     val value = source.loginUrl?.trim().orEmpty()
     if (value.isEmpty()) {
-        val home = source.baseUrl.toHttpUrlOrNull() ?: return null
+        val home = source.baseUrl.toHttpUrlOrNull() ?: return emptyList()
         return if (source.loginUi.isNullOrBlank() && home.isHttps && home.username.isEmpty() && home.password.isEmpty() && !isPrivateNetworkLiteral(home.host))
-            WebLoginTarget(home.toString(), partial = true, home = true) else null
+            listOf(WebLoginTarget(home.toString(), partial = true, home = true)) else emptyList()
     }
-    if (value.length > 256 * 1024) return null
+    if (value.length > 256 * 1024) return emptyList()
     val direct = runCatching { URI(value) }.getOrNull()?.let { uri ->
         if (uri.isAbsolute || value.startsWith("/") || value.startsWith("./") || value.startsWith("../")) value else null
     }
-    val declared = direct ?: runCatching {
+    val declared = direct?.let(::listOf) ?: runCatching {
         val code = value.removePrefix("@js:").removePrefix("<js>").removeSuffix("</js>")
         val environment = CompilerEnvirons().apply { languageVersion = Context.VERSION_ES6 }
         val tree = Parser(environment).parse(code, "login", 1)
@@ -56,8 +59,18 @@ private fun parseWebLoginTarget(source: BookSourceRule): WebLoginTarget? {
             }
             true
         }
-        targets.singleOrNull()
-    }.getOrNull() ?: return null
+        targets.toList()
+    }.getOrNull() ?: return emptyList()
+    if (declared.size !in 1..8) return emptyList()
+    val targets = declared.mapNotNull { normalizeTarget(source, it, direct == null) }
+    val base = source.baseUrl.toHttpUrlOrNull() ?: return emptyList()
+    val primary = base.newBuilder().encodedPath("/").query(null).fragment(null).build().toString()
+    val foreign = targets.map { it.url.toHttpUrlOrNull()!!.newBuilder().encodedPath("/").query(null).fragment(null).build().toString() }.filter { it != primary }.distinct()
+    // 候选项可有多条路径，但不能悄悄突破来源＋一个声明登录站点的认证边界。
+    return if (foreign.size <= 1) targets.distinctBy { it.url } else emptyList()
+}
+
+private fun normalizeTarget(source: BookSourceRule, declared: String, scripted: Boolean): WebLoginTarget? {
     val declaredUri = runCatching { URI(declared) }.getOrNull() ?: return null
     if (declaredUri.isAbsolute && declaredUri.rawAuthority.isNullOrEmpty()) return null
     val base = source.baseUrl.toHttpUrlOrNull() ?: return null
@@ -68,11 +81,14 @@ private fun parseWebLoginTarget(source: BookSourceRule): WebLoginTarget? {
     val url = if (upgraded) original.newBuilder().scheme("https").port(443).build() else original
     if (!url.isHttps || url.username.isNotEmpty() || url.password.isNotEmpty() || isPrivateNetworkLiteral(url.host)) return null
     if (url.toString().contains("{{") || url.toString().contains("}}") || declared.contains("{{")) return null
-    return WebLoginTarget(url.toString(), direct == null || !source.loginUi.isNullOrBlank() || upgraded, upgraded = upgraded)
+    return WebLoginTarget(url.toString(), scripted || !source.loginUi.isNullOrBlank() || upgraded, upgraded = upgraded)
 }
 
 /** 来源规则改域或登录站点变化时得到新作用域，旧身份不会自动迁移。 */
 fun sourceAuthScope(source: BookSourceRule): SourceAuthScope? {
-    val target = webLoginTarget(source)
-    return SourceAuthScope.create(source.id, source.baseUrl, listOfNotNull(target?.url))
+    val targets = webLoginTargets(source)
+    val base = source.baseUrl.toHttpUrlOrNull() ?: return null
+    val primary = base.newBuilder().encodedPath("/").query(null).fragment(null).build().toString()
+    val origins = targets.map { it.url.toHttpUrlOrNull()!!.newBuilder().encodedPath("/").query(null).fragment(null).build().toString() }.distinct().filter { it != primary }
+    return SourceAuthScope.create(source.id, source.baseUrl, origins)
 }

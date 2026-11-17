@@ -4,6 +4,13 @@ import com.radium.inkwell.core.source.BookSourceRule
 import kotlin.test.*
 
 class WebLoginTargetTest {
+    @Test fun 同一认证边界内多个静态入口可单选且不把资源当作候选() {
+        val source = BookSourceRule("https://example.com", loginUrl = "java.startBrowser('https://example.com/login');java.startBrowserAwait('https://example.com/mobile');")
+        assertEquals(listOf("https://example.com/login", "https://example.com/mobile"), webLoginTargets(source).map { it.url })
+        assertNotNull(sourceAuthScope(source))
+        assertFalse(sourceAuthScope(source)!!.permits("https://cdn.example.test/"))
+    }
+
     @Test fun 只提取真实语法树中的唯一静态浏览器地址() {
         val source = BookSourceRule("https://example.com", loginUrl = """
             // java.startBrowserAwait("https://ignored.test/")

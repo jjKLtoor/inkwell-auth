@@ -5,5 +5,7 @@ sealed interface LoginPageEvent {
     data object Loading : LoginPageEvent
     data object Visible : LoginPageEvent
     data class Failed(val reason: String) : LoginPageEvent
+    data class Location(val origin: String) : LoginPageEvent
+    data class Notice(val message: String) : LoginPageEvent
     data class Blocked(val origin: String?, val mainFrame: Boolean, val kind: LoginResourceKind = if (mainFrame) LoginResourceKind.NAVIGATION else LoginResourceKind.OTHER) : LoginPageEvent
 }

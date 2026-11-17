@@ -17,6 +17,42 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class EncryptedSessionStoreTest {
+    @Test fun `网页许可随会话加密恢复且引擎轮换不扩大凭据范围`() = runBlocking {
+        val root = temporary.newFolder()
+        val store = EncryptedSessionStore(root, cipher)
+        val origin = "https://cdn.example.test/"
+        val sessions = PersistentSourceSessions(store)
+        sessions.replace(scope, CookieSession(listOf(persistent()), webOrigins = listOf(origin), allowWebResources = true, loginPageUrl = "https://example.com/member"))
+        assertEquals(listOf(origin), store.load(scope)!!.webOrigins)
+        assertTrue(store.load(scope)!!.allowWebResources)
+        assertEquals("https://example.com/member", store.load(scope)!!.loginPageUrl)
+        val active = sessions.open(scope)
+        assertTrue(active.loadForRequest(origin.toHttpUrl()).isEmpty())
+        active.saveFromResponse(scope.originUrl.toHttpUrl(), listOf(persistent("rotated")))
+        active.flush()
+        assertEquals(listOf(origin), store.load(scope)!!.webOrigins)
+        assertEquals("rotated", store.load(scope)!!.cookies.single().value)
+        assertFalse(root.listFiles()!!.single().readBytes().toString(Charsets.ISO_8859_1).contains(origin))
+        sessions.logout(scope)
+        assertNull(store.load(scope))
+    }
+
+    @Test fun `不保存危险网页许可且可读取旧版v3会话`() = runBlocking {
+        val root = temporary.newFolder()
+        val store = EncryptedSessionStore(root, cipher)
+        listOf("http://cdn.example.test/", "https://127.0.0.1/", "https://cdn.example.test/path?token=fixture").forEach { site ->
+            assertFailsWith<IllegalArgumentException> { store.save(scope, CookieSession(listOf(persistent()), webOrigins = listOf(site))) }
+        }
+        store.save(scope, CookieSession(listOf(persistent())))
+        val plain = java.io.ByteArrayOutputStream().also { bytes -> java.io.DataOutputStream(bytes).use { out ->
+            out.writeInt(3); out.writeInt(1); out.writeUTF(persistent().toString()); out.writeUTF("example.com"); out.writeInt(0)
+        } }.toByteArray()
+        val binding = java.security.MessageDigest.getInstance("SHA-256").digest((scope.sourceId + "\u0000" + scope.originUrls.joinToString("\u0000")).toByteArray())
+        root.listFiles()!!.single().writeBytes(cipher.encrypt(plain, binding))
+        assertEquals("fixture-secret", store.load(scope)!!.cookies.single().value)
+        assertTrue(store.load(scope)!!.webOrigins.isEmpty())
+    }
+
     @get:Rule val temporary = TemporaryFolder()
     private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
     private val cipher = AesGcmSessionCipher { key }

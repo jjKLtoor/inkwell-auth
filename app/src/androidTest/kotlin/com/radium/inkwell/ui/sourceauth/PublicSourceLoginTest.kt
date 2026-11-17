@@ -78,12 +78,12 @@ class PublicSourceLoginTest {
                             val navigationOrigin = navigation?.origin
                             if (navigationOrigin != null) {
                                 confirmation = "REVIEW_MISSING"
-                                val review = device.wait(Until.findObject(By.text("核对站点")), 5000)
+                                val review = device.wait(Until.findObject(By.text("选择登录站点")), 5000)
                                 if (review != null) {
                                     review.click()
                                     confirmation = "DIALOG_NOT_READY"
                                     val dialog = device.wait(Until.findObject(By.textContains(navigationOrigin)), 5000)
-                                    val allow = device.wait(Until.findObject(By.text("本次允许")), 5000)
+                                    val allow = device.wait(Until.findObject(By.text("允许并继续")), 5000)
                                     if (dialog != null && allow != null) {
                                         priorEvents.addAll(events); events.clear()
                                         allow.click()
