@@ -99,6 +99,8 @@ data class JsContext(
     val scriptVars: MutableMap<String, String> = ConcurrentHashMap(),
     /** 源的公共脚本库（阅读的 jsLib）：规则、模板、地址里的脚本都能调它定义的函数 */
     val jsLib: String? = null,
+    val interaction: com.radium.inkwell.core.source.js.SourceScriptInteraction? = null,
+    val strictScripts: Boolean = false,
 )
 
 /** 规则求值器；正则按 pattern 缓存预编译；scriptRuntime 为空时 js 规则报不支持 */
@@ -787,9 +789,12 @@ class RuleEvaluator(
      * 来源级的脚本（源级 header 的 `@js:` / `<js>`）：同阅读的 BaseSource.evalJS，不在哪一页上跑，
      * 没有 `result`，脚本原样跑、不先展开 `{{}}`。没有 JS 引擎、脚本报错都返回 null，由调用方当「没有」处理
      */
-    fun evalSourceScript(script: String, ctx: EvalContext): String? {
-        if (scriptRuntime == null) return null
-        return runJs(script, ctx, input = "")
+    fun evalSourceScript(script: String, ctx: EvalContext, input: Any = ""): String? {
+        if (scriptRuntime == null) {
+            if (ctx.js.strictScripts) throw UnsupportedRuleException("当前未提供来源登录脚本引擎")
+            return null
+        }
+        return runJs(script, ctx, input = input)
     }
 
     /**
@@ -816,9 +821,11 @@ class RuleEvaluator(
         val runtime = scriptRuntime
             ?: throw UnsupportedRuleException("该来源需要 JS 引擎，当前版本不支持")
         val store = sourceStores.getOrPut(ctx.js.sourceKey) { ConcurrentHashMap() }
+        val loginSession = com.radium.inkwell.core.source.auth.SourceRequestSession.current()?.takeIf { ctx.js.interaction != null }
+        val boundHttp = if (loginSession != null && jsHttp != null) com.radium.inkwell.core.source.js.SessionBoundJsHttp(jsHttp, loginSession, (jsHttp as? com.radium.inkwell.core.source.js.EngineJsHttp)?.bindingTo(com.radium.inkwell.core.source.js.EngineJsHttp.currentJob()) ?: kotlin.coroutines.EmptyCoroutineContext) else jsHttp
         val java = com.radium.inkwell.core.source.js.JavaBridge(
-            jsHttp, jsCache, ctx.js.scriptVars, query = ruleQuery(ctx), chinese = runtime.chineseConverter,
-            deviceId = { runtime.androidId },
+            boundHttp, jsCache, ctx.js.scriptVars, query = ruleQuery(ctx), chinese = runtime.chineseConverter,
+            deviceId = { runtime.androidId }, interaction = ctx.js.interaction,
         )
         return try {
             val inUrl = ctx.json == null && ctx.element == null
@@ -841,9 +848,9 @@ class RuleEvaluator(
                     }
                     put("title", ctx.js.chapter.title)
                     put("java", java)
-                    put("cookie", com.radium.inkwell.core.source.js.CookieBridge(jsHttp))
+                    put("cookie", com.radium.inkwell.core.source.js.CookieBridge(boundHttp))
                     put("cache", jsCache)
-                    put("source", com.radium.inkwell.core.source.js.SourceBridge(ctx.js.sourceKey, store, ctx.js.sourceFacts))
+                    put("source", com.radium.inkwell.core.source.js.SourceBridge(ctx.js.sourceKey, store, ctx.js.sourceFacts, loginSession))
                     put("book", ctx.js.book)
                     put("chapter", ctx.js.chapter)
                 },
@@ -851,6 +858,7 @@ class RuleEvaluator(
         } catch (e: Exception) {
             // 取消不是「脚本报错」：吞掉的话，被取消的那次调用还会带着空结果把剩下的条目一个个求值完
             if (e is kotlinx.coroutines.CancellationException) throw e
+            if (ctx.js.strictScripts) throw SourceException("来源登录脚本执行失败，可能使用了尚未支持的能力")
             null
         }
     }

@@ -170,6 +170,20 @@ class BookSourceEngine(
                 }
             }
         }
+    /** 显式点击来源表单按钮后运行；复用同一脚本存储和 HTTP，草稿会话由 Android 侧决定何时原子提交。 */
+    suspend fun runLoginAction(
+        source: BookSourceRule, script: String, fields: Map<String, String>,
+        session: com.radium.inkwell.core.source.auth.SourceRequestSession,
+        interaction: com.radium.inkwell.core.source.js.SourceScriptInteraction,
+    ): String? = withContext(Dispatchers.IO) {
+        require(session.scope.sourceId == source.id && session.restrictNetworkToScope && session.active)
+        withContext(jsHttp.bindingTo(coroutineContext[Job]) + com.radium.inkwell.core.source.auth.SourceRequestSession.binding(session)) {
+            val info = kotlinx.serialization.json.JsonObject(fields.mapValues { kotlinx.serialization.json.JsonPrimitive(it.value) }).toString()
+            if (fields.isNotEmpty()) session.loginData["\$loginInfo"] = info
+            val ctx = EvalContext(null, null, source.baseUrl, js = jsContextOf(source).copy(interaction = interaction, strictScripts = true))
+            evaluator.evalSourceScript(script, ctx, com.radium.inkwell.core.source.js.ScriptJson(info))
+        }
+    }
     suspend fun search(source: BookSourceRule, keyword: String, page: Int = 1): SearchPage =
         engineIo(source) {
             val searchUrl = source.searchUrl?.takeIf { it.isNotBlank() }

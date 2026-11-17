@@ -10,6 +10,8 @@ interface SourceRequestSession : CookieJar {
     val active: Boolean
     val hasCredentials: Boolean
     val loginData: MutableMap<String, String>
+    /** 交互登录脚本只能向已授权身份站点发请求，不能把表单数据带到其他域。 */
+    val restrictNetworkToScope: Boolean get() = false
     /** 仅供隔离渲染器恢复完整 Cookie 元数据，默认不授权旧实现导出身份。 */
     fun cookiesForRendering(): List<okhttp3.Cookie> = emptyList()
     /** 隔离渲染结束后的乐观合并；实现须拒绝覆盖并发更新或已撤销的身份。 */

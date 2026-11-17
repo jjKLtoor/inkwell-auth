@@ -167,8 +167,16 @@ class SourceHttpClient(
         val originalHeaderNames = runCatching {
             (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject).keys.toSet()
         }.getOrDefault(emptySet())
-        return base.newBuilder().cookieJar(session).addNetworkInterceptor { chain ->
+        return base.newBuilder().cookieJar(session).addInterceptor { chain ->
+            if (session.restrictNetworkToScope && (!session.active || !session.scope.permits(chain.request().url.toString()))) {
+                throw IOException("来源登录请求超出已授权认证范围")
+            }
+            chain.proceed(chain.request())
+        }.addNetworkInterceptor { chain ->
             val request = chain.request()
+            if (session.restrictNetworkToScope && (!session.active || !session.scope.permits(request.url.toString()))) {
+                throw IOException("来源登录请求超出已授权认证范围")
+            }
             val builder = request.newBuilder()
             val saved = runCatching {
                 (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject)

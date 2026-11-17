@@ -35,7 +35,9 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
     }
 
     suspend fun replace(scope: SourceAuthScope, cookies: CookieSession) = mutex.withLock {
-        store.save(scope, cookies)
+        // 表单可能含密码或 Token，登录信息只留内存；磁盘始终只收持久 Cookie 与认证 Header。
+        val persistent = persistentSnapshot(cookies)
+        if (persistent.cookies.isEmpty() && persistent.loginData.isEmpty()) store.clear(scope) else store.save(scope, persistent)
         sessions.remove(scope)?.revoke()
         sessions[scope] = Session(scope, cookies)
     }

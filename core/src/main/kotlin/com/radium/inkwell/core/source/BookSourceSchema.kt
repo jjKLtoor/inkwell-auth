@@ -70,6 +70,8 @@ data class BookSourceRule(
      * 这个字段之前导入的书源没存它：重新导入一次才有
      */
     val jsLib: String? = null,
+    /** 来源变量说明，登录脚本可能用它判断配置入口；不包含用户输入的表单值。 */
+    val variableComment: String? = null,
 ) {
     /** 书源唯一标识 = 站点地址（含 Legado 的 `#后缀`，同站多源靠它区分） */
     val id: String get() = bookSourceUrl
@@ -111,6 +113,7 @@ data class BookSourceRule(
         com.radium.inkwell.core.source.js.SourceFacts(
             name = bookSourceName,
             comment = bookSourceComment,
+            variableComment = variableComment,
             group = bookSourceGroup,
             type = bookSourceType,
             loginUrl = loginUrl,

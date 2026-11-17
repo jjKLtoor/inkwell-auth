@@ -10,6 +10,18 @@ import com.radium.inkwell.sourceauth.EncryptedSessionStore
 import com.radium.inkwell.sourceauth.LoginConfiguration
 import com.radium.inkwell.sourceauth.resolveLoginConfiguration
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
+import com.radium.inkwell.sourceauth.DraftLoginSession
+import com.radium.inkwell.sourceauth.SourceLoginForm
+import com.radium.inkwell.sourceauth.parseSourceLoginForm
+import com.radium.inkwell.core.source.BookSourceEngine
+import com.radium.inkwell.core.source.BookSourceRule
+import com.radium.inkwell.core.source.js.SourceScriptInteraction
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +40,9 @@ data class SourceLoginState(
     val browsing: Boolean = false,
     val busy: Boolean = false,
     val message: String = "正在读取登录配置",
+    val form: SourceLoginForm? = null,
+    val formError: Boolean = false,
+    val sourceFeedback: String = "",
 )
 
 class SourceLoginViewModel(
@@ -35,15 +50,25 @@ class SourceLoginViewModel(
     private val sources: BookSourceRepository,
     private val store: EncryptedSessionStore,
     private val sessions: com.radium.inkwell.sourceauth.PersistentSourceSessions,
+    private val engine: BookSourceEngine,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(SourceLoginState())
     val state = mutableState.asStateFlow()
+
+    private var loadedSource: BookSourceRule? = null
+    private var actionJob: Job? = null
+    private var actionToken: Any? = null
+    private var actionPage: LoginConfiguration.WebPage? = null
+    private class BrowserWait(val draft: DraftLoginSession, val done: CompletableDeferred<String>)
+    private var browserWait: BrowserWait? = null
 
     init {
         viewModelScope.launch {
             try {
                 val source = sources.getRule(sourceId)
                 if (source == null) { fail("来源不存在"); return@launch }
+                loadedSource = source
+                val form = withContext(Dispatchers.Default) { runCatching { parseSourceLoginForm(source) } }
                 val (config, scope) = withContext(Dispatchers.Default) {
                     resolveLoginConfiguration(source) to com.radium.inkwell.sourceauth.sourceAuthScope(source)
                 }
@@ -53,8 +78,8 @@ class SourceLoginViewModel(
                 }.plus(listOfNotNull(source.baseUrl.toHttpUrl().takeIf { scope.permits(it.toString()) && it.username.isEmpty() && it.password.isEmpty() }?.let {
                     LoginConfiguration.WebPage(it.toString(), partial = true, home = true)
                 })).distinctBy { it.url } else emptyList()
-                mutableState.value = mutableState.value.copy(name = source.name, scope = scope, page = page, pages = pages)
-                if (page == null || scope == null) {
+                mutableState.value = mutableState.value.copy(name = source.name, scope = scope, page = page, pages = pages, form = form.getOrNull(), formError = form.isFailure)
+                if (scope == null || page == null && form.getOrNull() == null) {
                     fail(when (config) {
                         LoginConfiguration.NotConfigured -> "该来源未配置登录"
                         is LoginConfiguration.Unsupported -> when (config.reason) {
@@ -66,7 +91,7 @@ class SourceLoginViewModel(
                     })
                     return@launch
                 }
-                if (withContext(Dispatchers.IO) { isPrivateNetworkHost(page.url.toHttpUrl().host) }) {
+                if (page != null && withContext(Dispatchers.IO) { isPrivateNetworkHost(page.url.toHttpUrl().host) }) {
                     mutableState.value = mutableState.value.copy(page = null)
                     fail("已阻止访问私网登录地址")
                     return@launch
@@ -76,7 +101,7 @@ class SourceLoginViewModel(
                 val selected = pages.firstOrNull { it.url == restored?.loginPageUrl } ?: page
                 mutableState.value = mutableState.value.copy(loaded = true, restored = restored,
                     page = selected,
-                    browsing = restored?.cookies?.any { it.expiresAt > System.currentTimeMillis() } == true,
+                    browsing = form.getOrNull() == null && restored?.cookies?.any { it.expiresAt > System.currentTimeMillis() } == true,
                     message = when {
                         sessions.storageFailed(scope) -> "会话更新未能保存，请重新登录"
                         restored == null -> "未登录"
@@ -90,13 +115,83 @@ class SourceLoginViewModel(
         }
     }
 
+    private fun cancelAction() {
+        if (actionToken != null) mutableState.value = mutableState.value.copy(page = actionPage)
+        actionPage = null
+        actionToken = null
+        browserWait?.let { it.draft.revoke(); it.done.cancel() }; browserWait = null
+        actionJob?.cancel(); actionJob = null
+    }
+
+    /** 只执行用户点选的规则按钮；网页返回时续跑同一次脚本，不以重跑脚本模拟 await。 */
+    fun runAction(index: Int, values: Map<String, String>) {
+        if (mutableState.value.busy || mutableState.value.browsing || actionJob?.isActive == true) return
+        val source = loadedSource ?: return
+        val scope = mutableState.value.scope ?: return
+        val form = mutableState.value.form ?: return
+        val action = if (index == -1 && form.hasSubmit) "login(result)" else form.controls.getOrNull(index)?.takeIf { it.type == "button" }?.action
+        if (action.isNullOrBlank()) return
+        val permitted = form.controls.filter { it.type == "edit" || it.type == "password" }.map { it.name }.toSet()
+        val fields = values.filterKeys { it in permitted }
+        if (fields.size > 100 || fields.values.any { it.length > 8192 } || fields.values.sumOf { it.length } > 65536) { fail("登录表单内容过长"); return }
+        val token = Any(); actionToken = token
+        val entry = mutableState.value.page
+        actionPage = entry
+        mutableState.value = mutableState.value.copy(busy = true, message = "正在执行来源登录操作…", sourceFeedback = "")
+        actionJob = viewModelScope.launch {
+            var draft: DraftLoginSession? = null
+            try {
+                val original = sessions.open(scope)
+                val saved = sessions.savedSnapshot(scope)
+                val initial = CookieSession(original.cookiesForRendering(), original.loginData.toMap(), loginPageUrl = saved?.loginPageUrl)
+                val working = DraftLoginSession(scope, initial); draft = working
+                val owner = currentCoroutineContext()[Job]!!
+                val host = object : SourceScriptInteraction {
+                    override fun notice(message: String) {
+                        viewModelScope.launch { if (actionToken === token) mutableState.value = mutableState.value.copy(sourceFeedback = message.take(2000)) }
+                    }
+                    override fun browser(url: String, title: String?, await: Boolean): String = runBlocking(owner + com.radium.inkwell.core.source.auth.SourceRequestSession.binding(working)) {
+                        val target = url.toHttpUrlOrNull() ?: error("来源登录地址无效")
+                        check(working.active && scope.permits(url) && target.username.isEmpty() && target.password.isEmpty()) { "来源登录站点未授权" }
+                        if (withContext(Dispatchers.IO) { isPrivateNetworkHost(target.host) }) error("已阻止私网登录地址")
+                        val pending = BrowserWait(working, CompletableDeferred())
+                        withContext(Dispatchers.Main) {
+                            com.radium.inkwell.sourceauth.LoginWebSession.awaitIdle()
+                            check(actionToken === token && browserWait == null)
+                            browserWait = pending
+                            mutableState.value = mutableState.value.copy(busy = false, browsing = true, page = LoginConfiguration.WebPage(url, partial = true),
+                                restored = working.snapshot(entry?.url), message = "请完成网页登录后保存会话，随后继续来源脚本")
+                        }
+                        if (await) pending.done.await() else ""
+                    }
+                }
+                val result = engine.runLoginAction(source, form.script + "\n" + action, fields, working, host)
+                browserWait?.done?.await()
+                currentCoroutineContext().ensureActive()
+                if (result == "false") error("来源操作返回失败")
+                val snapshot = working.snapshot(entry?.url)
+                withContext(NonCancellable) { sessions.replace(scope, snapshot) }
+                if (actionToken === token) mutableState.value = mutableState.value.copy(restored = sessions.savedSnapshot(scope),
+                    message = "会话已保存；来源脚本已执行，登录状态未知")
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (actionToken === token) mutableState.value = mutableState.value.copy(message = "来源登录操作未完成；原会话未修改，请检查规则所需能力")
+            } finally {
+                draft?.revoke()
+                if (actionToken === token) {
+                    browserWait?.done?.cancel(); browserWait = null; actionJob = null; actionToken = null; actionPage = null
+                    mutableState.value = mutableState.value.copy(busy = false, browsing = false, page = entry)
+                }
+            }
+        }
+    }
     fun start() { if (mutableState.value.busy || mutableState.value.browsing) return; mutableState.value = mutableState.value.copy(browsing = true, message = "正在打开登录网页…") }
     fun selectPage(url: String) {
         if (mutableState.value.busy || mutableState.value.browsing) return
         mutableState.value.pages.firstOrNull { it.url == url }?.let { mutableState.value = mutableState.value.copy(page = it) }
     }
-    fun cancel() { mutableState.value = mutableState.value.copy(browsing = false, message = "已取消，之前保存的会话未修改") }
-    fun fail(message: String) { mutableState.value = mutableState.value.copy(loaded = true, browsing = false, busy = false, message = message) }
+    fun cancel() { cancelAction(); mutableState.value = mutableState.value.copy(browsing = false, busy = false, message = "已取消来源操作") }
+    fun fail(message: String) { cancelAction(); mutableState.value = mutableState.value.copy(loaded = true, browsing = false, busy = false, message = message) }
 
     fun refreshCookies() {
         if (mutableState.value.busy || mutableState.value.browsing) return
@@ -135,6 +230,15 @@ class SourceLoginViewModel(
 
     fun save(session: CookieSession) {
         if (mutableState.value.busy) return
+        browserWait?.let { pending ->
+            try {
+                pending.draft.importCookies(session)
+                browserWait = null
+                mutableState.value = mutableState.value.copy(browsing = false, busy = true, message = "正在继续来源登录脚本…")
+                pending.done.complete("")
+            } catch (_: Exception) { fail("网页登录数据不符合当前来源的认证范围") }
+            return
+        }
         val scope = mutableState.value.scope ?: return
         if (session.cookies.none { it.persistent && it.expiresAt > System.currentTimeMillis() }) {
             mutableState.value = mutableState.value.copy(message = "未发现可恢复的 Cookie，之前保存的会话未修改")

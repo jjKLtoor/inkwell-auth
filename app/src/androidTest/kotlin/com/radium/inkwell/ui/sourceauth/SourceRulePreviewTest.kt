@@ -29,8 +29,8 @@ class SourceRulePreviewTest {
             assertNotNull(show)
             assertFalse(device.hasObject(By.textContains("规则开头")))
             show.click()
-            assertTrue(device.hasObject(By.textContains("规则开头")))
-            assertTrue(device.hasObject(By.textContains("规则末尾")))
+            assertTrue(device.wait(Until.hasObject(By.textContains("规则开头")), 10000))
+            assertTrue(device.wait(Until.hasObject(By.textContains("规则末尾")), 10000))
             assertFalse(device.hasObject(By.text("下一段")))
         } finally { inst.runOnMainSync { activity.finish() } }
     }

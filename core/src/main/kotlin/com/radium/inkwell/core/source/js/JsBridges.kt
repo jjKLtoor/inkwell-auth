@@ -275,10 +275,12 @@ class SourceBridge(
     private val key: String,
     private val store: MutableMap<String, String> = ConcurrentHashMap(),
     private val facts: SourceFacts = SourceFacts(),
+    private val loginSession: com.radium.inkwell.core.source.auth.SourceRequestSession? = null,
 ) {
     @JvmField val bookSourceUrl: String = key
     @JvmField val bookSourceName: String = facts.name
     @JvmField val bookSourceComment: String = facts.comment
+    @JvmField val variableComment: String? = facts.variableComment
     @JvmField val bookSourceGroup: String = facts.group
     @JvmField val bookSourceType: Int = facts.type
     @JvmField val loginUrl: String? = facts.loginUrl
@@ -337,7 +339,7 @@ class SourceBridge(
     // 引擎会话内按来源读写；Header 可加密恢复，登录信息可能含密码，只在进程内保留。
 
     private fun loginStore(): MutableMap<String, String> =
-        com.radium.inkwell.core.source.auth.SourceRequestSession.current()?.let {
+        (loginSession ?: com.radium.inkwell.core.source.auth.SourceRequestSession.current())?.let {
             if (it.active) it.loginData else java.util.concurrent.ConcurrentHashMap<String, String>()
         } ?: store
 
@@ -397,6 +399,7 @@ class SourceFacts(
     val exploreUrl: String? = null,
     /** 规则集按阅读的字段名：`ruleSearch` → { bookList, name, … }；没写的规则集、规则不在里面 */
     val ruleSets: Map<String, Map<String, String>> = emptyMap(),
+    val variableComment: String? = null,
 )
 
 /** Cookie，脚本里是 `cookie` */
@@ -532,6 +535,7 @@ class JavaBridge(
     private val chinese: ChineseConverter = ChineseConverter.NONE,
     /** [androidId] 给的设备号，见 [ScriptRuntime.androidId] */
     private val deviceId: () -> String = { "" },
+    private val interaction: SourceScriptInteraction? = null,
 ) {
 
     /** getString / getElement 落在哪份内容上；[setContent] 换掉它 */
@@ -593,9 +597,19 @@ class JavaBridge(
     // 缺一个方法，Rhino 就是 ReferenceError，整个书源直接判死。Legado 有的这些入口
     // 宁可给空壳：脚本照常往下走，最坏是拿不到人机验证后的页面，而不是整源不可用。
 
-    fun startBrowser(url: String, title: String?): String = ""
+    fun startBrowser(url: String, title: String?): String = interaction?.browser(url, title, false).orEmpty()
 
-    fun startBrowserAwait(url: String, title: String?): String = ""
+    fun startBrowserAwait(url: String, title: String?): StrResponse {
+        val host = interaction ?: return StrResponse.empty()
+        host.browser(url, title, true)
+        // 阅读的默认 await 在网页确认后重新发起原地址 GET，再交回 StrResponse。
+        return fetchWithOptions(url, "GET", null, emptyMap())
+    }
+
+    fun startBrowserAwait(url: String, title: String?, refetch: Boolean): StrResponse {
+        check(refetch) { "暂不支持返回网页 DOM 的登录等待方式" }
+        return startBrowserAwait(url, title)
+    }
 
     fun getVerificationCode(url: String): String = ""
 
@@ -827,9 +841,9 @@ class JavaBridge(
     /** 书源用它打调试日志；返回原值方便串在表达式里 */
     fun log(msg: Any?): Any? = msg
 
-    fun toast(msg: Any?): Any? = msg
+    fun toast(msg: Any?): Any? { interaction?.notice(msg?.toString().orEmpty()); return msg }
 
-    fun longToast(msg: Any?): Any? = msg
+    fun longToast(msg: Any?): Any? { interaction?.notice(msg?.toString().orEmpty()); return msg }
 
     fun cacheGet(key: String): String? = cache.get(key)
 

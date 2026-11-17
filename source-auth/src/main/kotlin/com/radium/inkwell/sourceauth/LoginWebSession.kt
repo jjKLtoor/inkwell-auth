@@ -288,6 +288,10 @@ class LoginWebSession(
         private const val PREFIX = "inkwell_auth_temp_"
         private var active = false // 所有读写均在 Main。
         private val cleanedProfiles = mutableSetOf<String>()
+        suspend fun awaitIdle() {
+            kotlinx.coroutines.withTimeout(5000) { while (active) kotlinx.coroutines.delay(25) }
+        }
+
         fun supported(): Boolean = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE) &&
             WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO) &&
             WebViewFeature.isFeatureSupported(WebViewFeature.DELETE_BROWSING_DATA)

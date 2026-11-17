@@ -21,6 +21,7 @@ class LoginSnapshotTest {
             val config = resolveLoginConfiguration(source)
             val scope = sourceAuthScope(source)
             val page = config as? LoginConfiguration.WebPage
+            val form = runCatching { parseSourceLoginForm(source) }
             buildJsonObject {
                 put("name", source.name)
                 put("source", source.id)
@@ -33,6 +34,8 @@ class LoginSnapshotTest {
                 })
                 page?.let { put("login_page", it.url) }
                 put("origins", JsonArray(scope?.originUrls.orEmpty().map(::JsonPrimitive)))
+                put("form", if (form.isFailure) "NOT_SUPPORTED" else if (form.getOrNull() != null) "STATIC_FORM" else "NONE")
+                put("form_controls", form.getOrNull()?.controls?.size ?: 0)
                 put("login", "NOT_TESTED")
                 put("search", "NOT_TESTED")
                 put("toc", "NOT_TESTED")

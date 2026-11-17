@@ -3,6 +3,8 @@ package com.radium.inkwell.ui.sourcedetail
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.radium.inkwell.core.source.BookSourceEngine
+import com.radium.inkwell.data.source.DEFAULT_SOURCE_TEST_KEYWORD
+import com.radium.inkwell.data.source.probeSourceContent
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.data.repo.NetBookRepository
 import com.radium.inkwell.ui.components.MessageBus
@@ -30,7 +32,7 @@ data class SourceDetailUiState(
      * 输入框改要一本书的网址，直接从详情页走起。
      */
     val searchable: Boolean = true,
-    val testKeyword: String = "剑",
+    val testKeyword: String = DEFAULT_SOURCE_TEST_KEYWORD,
     val testing: Boolean = false,
     val testReport: String = "",
 )
@@ -100,38 +102,42 @@ class SourceDetailViewModel(
                 report.appendLine(line)
                 _state.value = _state.value.copy(testReport = report.toString())
             }
+            step("测试：$input · 时限 ${TEST_TIMEOUT_MS / 1000} 秒")
             val finished = withTimeoutOrNull(TEST_TIMEOUT_MS) {
                 try {
+                    var searchVariables: Map<String, String> = emptyMap()
                     val bookUrl = if (rule.search != null) {
                         val page = engine.search(rule, input)
                         step("✔ 搜索: ${page.items.size} 条结果")
                         val first = page.items.firstOrNull() ?: error("搜索无结果")
                         step("  首条: ${first.title} / ${first.author ?: "?"}")
+                        searchVariables = first.variables
                         first.bookUrl
                     } else {
                         step("· 不能搜索，从网址开始")
                         input
                     }
 
-                    val (detail, toc) = netBookRepo.fetchDetailAndToc(rule, bookUrl)
+                    val (detail, toc) = netBookRepo.fetchDetailAndToc(rule, bookUrl, searchVariables)
                     step("✔ 详情: ${detail.title} tocUrl=${detail.tocUrl.take(60)}")
                     step("✔ 目录: ${toc.size} 章")
                     val firstChapter = toc.firstOrNull() ?: error("目录为空")
                     step("  首章: ${firstChapter.title}")
 
-                    val content = engine.getContent(
-                        rule, firstChapter.url,
-                        toc.mapTo(HashSet()) { it.url },
-                        chapterVariable = firstChapter.variable,
-                        chapterTitle = firstChapter.title,
-                        chapterIndex = firstChapter.index,
-                        variables = detail.variables,
-                    )
-                    val preview = content.elements
+                    val urls = toc.mapTo(HashSet()) { it.url }
+                    val probe = probeSourceContent(toc) { chapter ->
+                        engine.getContent(
+                            rule, chapter.url, urls, chapter.variable,
+                            chapterTitle = chapter.title, chapterIndex = chapter.index,
+                            bookUrl = bookUrl, bookTitle = detail.title, variables = detail.variables,
+                        )
+                    }
+                    val preview = probe.content.elements
                         .filterIsInstance<com.radium.inkwell.core.model.ContentElement.Paragraph>()
                         .take(2).joinToString(" / ") { it.text.take(40) }
-                    step("✔ 正文: ${content.elements.size} 段")
+                    step("✔ 正文: ${probe.chars} 字 · ${probe.chapter.title}")
                     step("  预览: $preview")
+                    step("✔ 全链路通过")
                 } catch (e: CancellationException) {
                     // 离开页面掐掉了冒烟，不是书源坏了 —— 别往报告里写一条「失败」
                     throw e

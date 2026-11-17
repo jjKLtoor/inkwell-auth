@@ -1,5 +1,6 @@
 package com.radium.inkwell.ui.sourcemanage
 
+import com.radium.inkwell.data.source.DEFAULT_SOURCE_TEST_KEYWORD
 import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
@@ -52,7 +53,7 @@ data class CheckProgress(
  * 关掉它能快好几倍。关键词也得可改 —— 生僻词会把好书源误判成「搜索无结果」。
  */
 data class CheckOptions(
-    val keyword: String = "我的",
+    val keyword: String = DEFAULT_SOURCE_TEST_KEYWORD,
     val timeoutMs: Long = 60_000,
     val checkDetail: Boolean = true,
     val checkToc: Boolean = true,

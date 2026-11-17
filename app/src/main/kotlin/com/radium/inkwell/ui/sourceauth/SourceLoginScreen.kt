@@ -29,7 +29,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun SourceLoginScreen(onBack: () -> Unit, viewModel: SourceLoginViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     SourceLoginContent(state, onBack, viewModel::start, viewModel::cancel, viewModel::fail, viewModel::save, viewModel::logout,
-        onSelectPage = viewModel::selectPage, onRefreshCookies = viewModel::refreshCookies, onEditCookie = viewModel::editCookie)
+        onSelectPage = viewModel::selectPage, onRefreshCookies = viewModel::refreshCookies, onEditCookie = viewModel::editCookie, onScriptAction = viewModel::runAction)
 }
 
 @Composable
@@ -48,6 +48,7 @@ internal fun SourceLoginContent(
     onSelectPage: (String) -> Unit = {},
     onRefreshCookies: () -> Unit = {},
     onEditCookie: (okhttp3.Cookie, String?) -> Unit = { _, _ -> },
+    onScriptAction: (Int, Map<String, String>) -> Unit = { _, _ -> },
 ) {
     var session by remember { mutableStateOf<LoginWebSession?>(null) }
     val coroutineScope = rememberCoroutineScope()
@@ -65,6 +66,11 @@ internal fun SourceLoginContent(
     var currentOrigin by remember { mutableStateOf("") }
     var showHelp by remember { mutableStateOf(false) }
     var showCookies by remember { mutableStateOf(false) }
+    var showForm by remember { mutableStateOf(false) }
+    // 不用 rememberSaveable，表单可能含密码，不进入进程恢复或备份。
+    val formValues = remember(state.form) { mutableStateMapOf<String, String>().apply {
+        state.form?.controls?.filter { it.type == "edit" || it.type == "password" }?.forEach { put(it.name, it.initial) }
+    } }
 
     LaunchedEffect(Unit) {
         try { LoginWebSession.cleanupOrphans(); supported = LoginWebSession.supported() }
@@ -73,6 +79,7 @@ internal fun SourceLoginContent(
     }
     fun back() { if (!busy && session?.goBack() != true) onCancel() }
     BackHandler(state.browsing) { back() }
+    BackHandler(showForm && !state.browsing) { onCancel(); showForm = false; formValues.clear() }
     LaunchedEffect(state.message) {
         if (state.browsing && (state.message.contains("会话已保存") || state.message.contains("Cookie") || state.message.contains("保存失败"))) pageMessage = state.message
     }
@@ -98,6 +105,11 @@ internal fun SourceLoginContent(
         return
     }
 
+    if (showForm && !state.browsing && state.form != null) {
+        SourceLoginFormScreen(state, formValues, { name, value -> formValues[name] = value }, onScriptAction,
+            onBack = { onCancel(); showForm = false; formValues.clear() }, onCancel = onCancel)
+        return
+    }
     AppScaffold(
         containerColor = pageColor,
         blurBars = !state.browsing,
@@ -210,13 +222,15 @@ internal fun SourceLoginContent(
                         Text(state.message, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         state.scope?.originUrls?.forEach { Text(it, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary) }
                         PrimaryButton(if (state.restored == null) "登录" else "重新登录",
-                            onClick = { blockedResources = false; pageMessage = "正在打开登录页…"; onStart() },
-                            enabled = state.loaded && state.page != null && supported && !checking && !state.busy, modifier = Modifier.fillMaxWidth())
+                            onClick = { if (state.form != null) showForm = true else { blockedResources = false; pageMessage = "正在打开登录页…"; onStart() } },
+                            enabled = state.loaded && (state.form != null || state.page != null && supported) && !checking && !state.busy, modifier = Modifier.fillMaxWidth())
                     }
                 }
                 SettingFootnote(when {
                     checking -> "正在检查网页登录环境…"
                     !supported -> "请更新系统 WebView 后重试"
+                    state.form != null -> "按来源定义的表单和按钮登录，网页保存后继续执行登录脚本。"
+                    state.formError -> "该来源的自定义表单类型暂不支持，当前只提供可识别的网页登录。"
                     state.page?.home == true -> "未声明登录地址，仅尝试打开来源首页。"
                     state.page?.upgraded == true -> "旧地址仅尝试 HTTPS，不使用明文登录。"
                     state.page?.partial == true -> "仅打开规则中明确声明的网页，不执行表单按钮脚本。"
