@@ -48,6 +48,8 @@ class SourceDetailViewModel(
     /** 一次性提示：与其他管理页一样走共享 MessageBus + CollectMessages */
     val messages = MessageBus()
 
+    private var loadedRule: com.radium.inkwell.core.source.BookSourceRule? = null
+
     init {
         viewModelScope.launch {
             val entity = sourceRepo.getEntity(sourceId)
@@ -56,8 +58,12 @@ class SourceDetailViewModel(
                 return@launch
             }
             // 解析 + 美化一整份规则 JSON（带大段脚本的源几十 KB），别在主线程上做
-            val pretty = withContext(Dispatchers.Default) { prettyOrRaw(entity.json) }
-            val searchable = sourceRepo.getRule(sourceId)?.search != null
+            val (rule, pretty) = withContext(Dispatchers.Default) {
+                val parsed = sourceRepo.parseRule(entity.json).getOrNull()
+                parsed to (parsed?.let(sourceRepo::encodeRule) ?: entity.json)
+            }
+            loadedRule = rule
+            val searchable = rule?.search != null
             _state.value = _state.value.copy(
                 loaded = true,
                 name = entity.name,
@@ -69,18 +75,15 @@ class SourceDetailViewModel(
         }
     }
 
-    /** 规则原文按原生格式美化展示；解析不出来就原样显示（不因展示失败而空屏） */
-    private fun prettyOrRaw(json: String): String =
-        sourceRepo.parseRule(json).map { sourceRepo.encodeRule(it) }.getOrDefault(json)
-
     fun setTestKeyword(text: String) {
         _state.value = _state.value.copy(testKeyword = text)
     }
 
     /** 搜索→取第1本→详情→目录→第1章正文，一键冒烟；不能搜索的源从用户给的网址开始 */
     fun testSearchChain() {
-        val rule = sourceRepo.parseRule(_state.value.jsonText).getOrElse {
-            messages.emit("规则解析失败: ${it.message?.take(120)}")
+        if (_state.value.testing) return
+        val rule = loadedRule ?: run {
+            messages.emit("规则尚未读取或解析失败")
             return
         }
         val input = _state.value.testKeyword.trim()

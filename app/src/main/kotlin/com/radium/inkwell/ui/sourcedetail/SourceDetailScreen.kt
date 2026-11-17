@@ -3,7 +3,6 @@ package com.radium.inkwell.ui.sourcedetail
 import com.radium.inkwell.ui.components.AppScaffold
 import com.radium.inkwell.ui.components.horizontalOnly
 import com.radium.inkwell.ui.components.pageScroll
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,7 +12,6 @@ import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import com.radium.inkwell.ui.components.AppSnackbarHost
 import com.radium.inkwell.ui.components.AppTopBar
@@ -141,14 +139,7 @@ fun SourceDetailScreen(
             SectionHeader("规则（只读，要改请重新导入或重新新建）")
             SettingGroup {
                 SettingBlock {
-                    // 只读展示：可选中复制，横向滚动避免长规则折行
-                    SelectionContainer {
-                        Text(
-                            state.jsonText,
-                            style = MiuixTheme.textStyles.footnote1.copy(fontFamily = FontFamily.Monospace),
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        )
-                    }
+                    SourceRulePreview(state.jsonText)
                 }
             }
         }

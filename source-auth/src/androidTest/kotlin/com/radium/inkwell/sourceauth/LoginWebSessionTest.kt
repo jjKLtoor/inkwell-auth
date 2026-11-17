@@ -20,6 +20,37 @@ import org.junit.runner.RunWith
 /** 使用实际 Chromium profile 和完整 Cookie API；只做本地夹具，不访问真实账号或网站。 */
 @RunWith(AndroidJUnit4::class)
 class LoginWebSessionTest {
+    @Test fun 临时站点自己的Cookie不导出且关闭后清理() = runBlocking {
+        withContext(Dispatchers.Main) {
+            assumeTrue(LoginWebSession.supported())
+            val context = InstrumentationRegistry.getInstrumentation().targetContext
+            val scope = requireNotNull(SourceAuthScope.create("temporary-fixture", "https://example.com/"))
+            val extra = "https://cdn.example.test/"
+            val events = java.util.concurrent.ConcurrentLinkedQueue<LoginPageEvent>()
+            val session = LoginWebSession(context, scope, { request ->
+                val body = if (request.url.host == "cdn.example.test") "<html><script>document.cookie='third=fixture; Path=/; Secure; Max-Age=3600'</script>temporary site</html>" else "<html>fixture</html>"
+                android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream(body.toByteArray()))
+            }, {})
+            session.onPageEvent = { events.add(it) }
+            val profile = WebViewCompat.getProfile(session.view)
+            try {
+                session.view.loadUrl(extra)
+                kotlinx.coroutines.withTimeout(10000) {
+                    while (events.none { it is LoginPageEvent.Blocked && it.origin == extra }) kotlinx.coroutines.delay(100)
+                }
+                assertTrue(session.approveTemporaryOrigin(extra))
+                session.view.loadUrl(extra)
+                kotlinx.coroutines.withTimeout(10000) {
+                    while (CookieManagerCompat.getCookieInfo(profile.cookieManager, extra).none { it.startsWith("third=") }) kotlinx.coroutines.delay(100)
+                }
+                assertTrue(session.capture().cookies.none { it.name == "third" })
+                assertFalse(scope.permits(extra))
+                session.close().await()
+                assertTrue(CookieManagerCompat.getCookieInfo(profile.cookieManager, extra).isEmpty())
+            } finally { session.close().await() }
+        }
+    }
+
     @Test fun 主页面HTTP错误与额外站点跳转均提供明确事件() = runBlocking {
         withContext(Dispatchers.Main) {
             assumeTrue(LoginWebSession.supported())

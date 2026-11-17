@@ -14,7 +14,6 @@ import androidx.webkit.ProfileStore
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import androidx.webkit.WebStorageCompat
-import com.radium.inkwell.core.source.SourceHttpClient
 import com.radium.inkwell.core.source.auth.SourceAuthScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
@@ -45,10 +44,18 @@ class LoginWebSession(
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
     private fun event(value: LoginPageEvent) { main.post { if (!closed) onPageEvent(value) } }
     private fun pageFailure(reason: String) { main.post { if (!closed) { onError(); onPageEvent(LoginPageEvent.Failed(reason)) } } }
-    private fun blockedEvent(url: String, mainFrame: Boolean) {
-        val parsed = okhttp3.HttpUrl.Companion.run { url.toHttpUrlOrNull() }
-        val origin = parsed?.newBuilder()?.encodedPath("/")?.query(null)?.fragment(null)?.username("")?.password("")?.build()?.toString()
-        event(LoginPageEvent.Blocked(origin, mainFrame))
+    private val navigation = LoginNavigationPolicy(scope)
+    private val reportedBlocks = ConcurrentHashMap.newKeySet<String>()
+    private fun blockedEvent(url: String, mainFrame: Boolean, kind: LoginResourceKind = loginResourceKind(url, mainFrame)) {
+        val origin = navigation.recordBlocked(url)
+        if (reportedBlocks.size < 64 && reportedBlocks.add(origin.orEmpty() + mainFrame + kind)) event(LoginPageEvent.Blocked(origin, mainFrame, kind))
+    }
+
+    /** 用户逐个确认后只在本次网页登录生效；私网/DNS 防护和阅读引擎认证边界保持原样。 */
+    suspend fun approveTemporaryOrigin(origin: String): Boolean {
+        val url = origin.toHttpUrlOrNull() ?: return false
+        if (withContext(Dispatchers.IO) { com.radium.inkwell.core.source.isPrivateNetworkHost(url.host) }) return false
+        return withContext(Dispatchers.Main) { !closed && navigation.approve(origin) }
     }
 
     private val profileName: String
@@ -56,7 +63,7 @@ class LoginWebSession(
     private val cookies: android.webkit.CookieManager
     private val storage: android.webkit.WebStorage
     val view: WebView
-    private var closed = false
+    @Volatile private var closed = false
     private var pendingCookieWrites = 0
     private var cleaning = false
     private val cleanup = CompletableDeferred<Unit>()
@@ -81,13 +88,18 @@ class LoginWebSession(
             }
             view.settings.apply {
                 javaScriptEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                builtInZoomControls = true
+                displayZoomControls = false
                 // 现代网页登录常依赖临时网页存储；只存在独立 profile，关闭时一并清理，不导出到引擎。
                 domStorageEnabled = true
                 allowFileAccess = false
                 allowContentAccess = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 cacheMode = WebSettings.LOAD_NO_CACHE
-                userAgentString = SourceHttpClient.DEFAULT_UA
+                // 使用当前系统 WebView 的真实标识，避免旧版固定 Chrome 标识与内核不一致。
+                userAgentString = WebSettings.getDefaultUserAgent(context)
                 setSupportMultipleWindows(false)
                 javaScriptCanOpenWindowsAutomatically = false
             }
@@ -96,7 +108,7 @@ class LoginWebSession(
             view.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    if (!scope.permits(url)) { blockedEvent(url, request.isForMainFrame); return blocked() }
+                    if (closed || !navigation.permits(url)) { blockedEvent(url, request.isForMainFrame, loginResourceKind(url, request.isForMainFrame, request.requestHeaders)); return blocked() }
                     if (visited.size < 256) visited.add(url)
                     return intercept(request).also { response ->
                         if (request.isForMainFrame && response != null && response.statusCode >= 400) pageFailure("网络保护阻止了登录页面，或页面返回 HTTP " + response.statusCode)
@@ -104,14 +116,14 @@ class LoginWebSession(
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val denied = !scope.permits(request.url.toString())
+                    val denied = !navigation.permits(request.url.toString())
                     if (denied) blockedEvent(request.url.toString(), request.isForMainFrame)
                     return denied
                 }
 
                 override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) { event(LoginPageEvent.Loading) }
                 override fun onPageCommitVisible(view: WebView, url: String) {
-                    if (scope.permits(url)) event(LoginPageEvent.Visible)
+                    if (navigation.permits(url)) event(LoginPageEvent.Visible)
                 }
                 override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
                     if (request.isForMainFrame) pageFailure("登录页面返回 HTTP " + response.statusCode)
@@ -164,13 +176,16 @@ class LoginWebSession(
         val records = visited.flatMap { url ->
             CookieManagerCompat.getCookieInfo(cookies, url).mapNotNull { parseWebViewCookie(url.toHttpUrl(), it) }
         }.distinctBy { "${it.name}\u0000${it.domain}\u0000${it.path}" }
-        CookieSession(records)
+        // 临时允许的网站可能持有自己的账号 Cookie，不能顺手导出到原来源的持久认证。
+        CookieSession(records.filter { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } })
     }
 
     /** 当前进程不能删除已加载的 profile，先销毁视图并等待其全部浏览数据清理完成。 */
     fun close(): Deferred<Unit> {
         if (closed) return cleanup
         closed = true
+        navigation.clear()
+        reportedBlocks.clear()
         try {
             view.stopLoading()
             view.destroy()
