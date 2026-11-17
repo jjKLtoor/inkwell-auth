@@ -9,7 +9,11 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.core.net.toUri
 import com.radium.inkwell.core.source.FetchedPage
-import com.radium.inkwell.core.source.PageRenderer
+import com.radium.inkwell.core.source.AuthenticatedPageRenderer
+import com.radium.inkwell.core.source.auth.SourceRequestSession
+import com.radium.inkwell.sourceauth.AuthenticatedWebViewProfile
+import java.io.IOException
+import kotlin.coroutines.resumeWithException
 import com.radium.inkwell.core.source.isPrivateNetworkHost
 import kotlin.coroutines.resume
 import kotlinx.coroutines.Dispatchers
@@ -32,9 +36,39 @@ class WebViewPageRenderer(
     private val context: Context,
     /** 单页渲染总超时；含加载与 JS 执行 */
     private val timeoutMs: Long = 25_000,
-) : PageRenderer {
+    private val authenticatedGuard: () -> ((WebResourceRequest) -> WebResourceResponse?) = { WebViewNetworkGuard()::intercept },
+) : AuthenticatedPageRenderer {
 
     private val mutex = Mutex()
+
+    override suspend fun renderAuthenticated(url: String, headers: Map<String, String>, userAgent: String?, session: SourceRequestSession): FetchedPage? {
+        if (!session.active || !session.scope.permits(url)) throw IOException("渲染地址超出当前来源认证范围")
+        val host = url.toUri().host ?: throw IOException("渲染地址无效")
+        if (withContext(Dispatchers.IO) { isPrivateNetworkHost(host) }) throw IOException("已阻止私网渲染地址")
+        if (!session.loginData["\$loginHeader"].isNullOrBlank() && session.loginData["\$loginHeader"]?.trim() != "{}") {
+            throw IOException("当前隔离网页渲染暂不支持认证 Header，不能按普通 Cookie 登录处理")
+        }
+        if (session.cookiesForRendering().isEmpty()) throw IOException("没有可供隔离网页恢复的 Cookie")
+        val safeHeaders = setOf("user-agent", "referer", "origin", "accept", "accept-language", "cache-control", "content-type")
+        if (headers.keys.any { it.lowercase() !in safeHeaders }) throw IOException("网页需要尚未支持的自定义请求头")
+        return AuthenticatedWebViewProfile.use(context, session, userAgent, authenticatedGuard()) { isolated ->
+            try {
+                withTimeout(timeoutMs) {
+                    isolated.prepare()
+                    loadPage(isolated.view, url, headers, isolated)
+                    val html = awaitSettledHtml(isolated.view)
+                    isolated.failure?.let { throw IOException(it) }
+                    if (!session.active) throw IOException("来源会话已退出")
+                    isolated.capture()
+                    FetchedPage(isolated.view.url ?: url, 200, html, "utf-8")
+                }
+            } catch (error: TimeoutCancellationException) {
+                throw IOException(isolated.failure ?: "带认证网页渲染超时", error)
+            } catch (error: RenderFailed) {
+                throw IOException(isolated.failure ?: error.message ?: "带认证网页渲染失败", error)
+            }
+        }
+    }
 
     override suspend fun render(
         url: String,
@@ -97,7 +131,7 @@ class WebViewPageRenderer(
     }
 
     /** 加载页面，等 onPageFinished；主文档加载失败直接放弃 */
-    private suspend fun loadPage(wv: WebView, url: String, headers: Map<String, String>) =
+    private suspend fun loadPage(wv: WebView, url: String, headers: Map<String, String>, isolated: AuthenticatedWebViewProfile? = null) =
         suspendCancellableCoroutine { cont ->
             val guard = WebViewNetworkGuard()
             wv.webViewClient = object : WebViewClient() {
@@ -108,10 +142,22 @@ class WebViewPageRenderer(
                 override fun shouldInterceptRequest(
                     view: WebView,
                     request: WebResourceRequest,
-                ): WebResourceResponse? = guard.intercept(request)
+                ): WebResourceResponse? = if (isolated != null) isolated.intercept(request) else guard.intercept(request)
 
-                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-                    guard.blocksNavigation(request)
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    val denied = isolated?.blocksNavigation(request) ?: guard.blocksNavigation(request)
+                    if (denied && request.isForMainFrame && cont.isActive) cont.resumeWithException(RenderFailed(isolated?.failure ?: "已阻止不安全跳转"))
+                    return denied
+                }
+
+                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                    if (request.isForMainFrame && cont.isActive) cont.resumeWithException(RenderFailed("网页返回 HTTP " + response.statusCode))
+                }
+
+                override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError) {
+                    handler.cancel()
+                    if (cont.isActive) cont.resumeWithException(RenderFailed("网页证书校验失败"))
+                }
 
                 override fun onPageFinished(view: WebView, finishedUrl: String) {
                     if (cont.isActive) cont.resume(Unit)
@@ -124,7 +170,7 @@ class WebViewPageRenderer(
                 ) {
                     // 只有主文档失败才算失败：子资源（图片/统计脚本）报错很常见，忽略
                     if (request.isForMainFrame && cont.isActive) {
-                        cont.cancel(RenderFailed("加载失败: ${error.description}"))
+                        cont.resumeWithException(RenderFailed("加载失败（代码 " + error.errorCode + "）"))
                     }
                 }
             }

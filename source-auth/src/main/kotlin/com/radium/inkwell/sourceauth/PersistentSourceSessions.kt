@@ -119,6 +119,25 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
             if (active) jar.saveFromResponse(url, cookies)
         }
 
+        @Synchronized override fun cookiesForRendering(): List<Cookie> =
+            if (active) jar.snapshot().filter { it.expiresAt > System.currentTimeMillis() } else emptyList()
+
+        @Synchronized override fun mergeRenderedCookies(original: List<Cookie>, current: List<Cookie>, observed: List<HttpUrl>) {
+            if (!active) return
+            val before = original.associateBy(::cookieIdentity)
+            val after = current.associateBy(::cookieIdentity)
+            val live = jar.snapshot().associateBy(::cookieIdentity)
+            for (id in before.keys + after.keys) {
+                // 网络请求已刷新或用户已手动编辑时，渲染器的旧副本不能反向覆盖。
+                if (live[id] != before[id]) continue
+                val next = after[id]
+                val old = before[id]
+                val updated = next ?: old?.takeIf { cookie -> observed.any { cookie.matches(it) } }?.newBuilder()?.expiresAt(0)?.build() ?: continue
+                val origin = observed.firstOrNull { sessionUrl -> scope.permits(sessionUrl.toString()) && updated.matches(sessionUrl) } ?: continue
+                jar.saveFromResponse(origin, listOf(updated))
+            }
+        }
+
         @Synchronized fun revoke() { active = false; jar.clear(); loginData.clear() }
 
         @Synchronized fun snapshot() = CookieSession(jar.snapshot(), loginData.toMap(), webOrigins, allowWebResources, loginPageUrl)

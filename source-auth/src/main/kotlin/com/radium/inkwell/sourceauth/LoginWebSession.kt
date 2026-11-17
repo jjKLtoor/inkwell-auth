@@ -242,7 +242,7 @@ class LoginWebSession(
         check(!closed)
         val records = visited.flatMap { url ->
             CookieManagerCompat.getCookieInfo(cookies, url).mapNotNull { parseWebViewCookie(url.toHttpUrl(), it) }
-        }.distinctBy { "${it.name}\u0000${it.domain}\u0000${it.path}" }
+        }
         // 临时允许的网站可能持有自己的账号 Cookie，不能顺手导出到原来源的持久认证。
         CookieSession(records.filter { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } },
             allowWebResources = true)

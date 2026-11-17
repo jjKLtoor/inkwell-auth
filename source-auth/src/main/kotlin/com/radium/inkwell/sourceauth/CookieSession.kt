@@ -9,7 +9,8 @@ import java.util.Collections
 /** 保留 Cookie 元数据，不把会话简化为无作用域字符串。没有任何自动 VERIFIED 判断。 */
 class CookieSession(cookies: List<Cookie>, loginData: Map<String, String> = emptyMap(), webOrigins: List<String> = emptyList(), val allowWebResources: Boolean = false, val loginPageUrl: String? = null) {
     val loginData: Map<String, String> = Collections.unmodifiableMap(LinkedHashMap(loginData))
-    val cookies: List<Cookie> = Collections.unmodifiableList(cookies.toList())
+    // 身份相同只保留最后的快照；登录后的新值不能被较早采集到的匿名值盖回去。
+    val cookies: List<Cookie> = Collections.unmodifiableList(cookies.associateBy(::cookieIdentity).values.toList())
     /** 旧版 v4 密文兼容字段，现已不参与网页加载决策；绝不加入阅读引擎的认证作用域。 */
     val webOrigins: List<String> = Collections.unmodifiableList(webOrigins.distinct())
     override fun toString(): String = "CookieSession(redacted)"
@@ -40,5 +41,7 @@ class SessionCookieJar(private val scope: SourceAuthScope, session: CookieSessio
     @Synchronized
     fun snapshot(): List<Cookie> = cookies.values.toList()
 
-    private fun key(cookie: Cookie) = "${cookie.name}\u0000${cookie.domain}\u0000${cookie.path}"
+    private fun key(cookie: Cookie) = cookieIdentity(cookie)
 }
+
+internal fun cookieIdentity(cookie: Cookie) = "${cookie.name}\u0000${cookie.domain}\u0000${cookie.path}"

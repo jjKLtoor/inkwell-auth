@@ -750,14 +750,16 @@ class BookSourceEngine(
 
     /** 交给渲染器；没注入渲染器或渲染失败返回 null，调用方退回静态抓取 */
     private suspend fun render(target: String, headers: Map<String, String>): FetchedPage? {
-        // 后台渲染使用默认 profile；有身份的请求不得进入共享网页环境。
+        // 有身份时只交给声明支持隔离会话的实现，绝不回到共享 WebView profile。
         val session = com.radium.inkwell.core.source.auth.SourceRequestSession.current()
-        if (session?.hasCredentials == true) return null
         val r = renderer ?: return null
         // UA 必须与静态抓取一致：站点常按 UA 给不同 DOM，规则是照静态那份写的
         val ua = headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
             ?: SourceHttpClient.DEFAULT_UA
-        return r.render(target, headers.withoutLegadoOnlyHeaders(), ua)?.also { page ->
+        val page = if (session?.hasCredentials == true) {
+            (r as? AuthenticatedPageRenderer)?.renderAuthenticated(target, headers.withoutLegadoOnlyHeaders(), ua, session)
+        } else r.render(target, headers.withoutLegadoOnlyHeaders(), ua)
+        return page?.also { page ->
             safeTrace?.onFetch(
                 FetchTrace(target, "RENDER", page.statusCode, page.finalUrl, page.detectedCharset, page.bodyText.take(500))
             )
@@ -919,7 +921,11 @@ class BookSourceEngine(
         js: JsContext = jsContextOf(source),
     ): SearchPage {
         val ctx = pageContext(fetched, vars, js)
-        val items = evalList(stage, listRule, ctx).mapNotNull { node ->
+        // 列表前导减号是顺序标记，搜索和发现与目录一样先剥离，再对整页结果反转。
+        val rawList = listRule.trim()
+        val reversed = rawList.startsWith("-")
+        val nodes = evalList(stage, if (reversed) rawList.substring(1) else rawList, ctx)
+        val items = (if (reversed) nodes.asReversed() else nodes).mapNotNull { node ->
             // 每条结果拷一份页面的变量表（同 Legado：每个 searchBook 拷一份 ruleData 的变量）：
             // 一条结果的规则里 put 的，不串到下一条
             val itemCtx = node.copy(
@@ -995,7 +1001,9 @@ class BookSourceEngine(
     private fun evalUrlFields(stage: String, name: String, rule: String?, ctx: EvalContext): List<String> {
         if (rule.isNullOrBlank()) return emptyList()
         return try {
-            val values = flattenUrlResults(evaluator.evalToStrings(LegadoRuleAnalyzer.analyze(rule), ctx))
+            // 旧版 JSON 来源的 {$.id} 链接占位符按模板求值，不能误当 CSS/JSONPath 整串。
+            val normalized = LEGACY_JSON_URL.replace(rule) { "{{" + it.groupValues[1] + "}}" }
+            val values = flattenUrlResults(evaluator.evalToStrings(LegadoRuleAnalyzer.analyze(normalized), ctx))
             safeTrace?.onRule(RuleTrace(stage, name, rule, values.joinToString(" | ").take(200)))
             values
         } catch (e: Exception) {
@@ -1019,6 +1027,7 @@ class BookSourceEngine(
 
     private companion object {
         val VARS_JSON = kotlinx.serialization.json.Json
+        val LEGACY_JSON_URL = Regex("""(?<!\{)\{(\$(?:\.|\[)[^{}]*)\}(?!\})""")
         val PAGE_VAR = Regex("\\{\\{[^}]*page[^}]*\\}\\}")
         const val MAX_TOC_PAGES = 200
         /** 目录分页的并发抓取数。再多就是对着同一个站点群发，限流、封 IP 的风险比省下的时间大 */

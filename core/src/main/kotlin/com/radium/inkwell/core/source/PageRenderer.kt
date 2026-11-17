@@ -22,3 +22,13 @@ interface PageRenderer {
         userAgent: String? = null,
     ): FetchedPage?
 }
+
+/** Android 侧显式提供隔离认证能力，默认渲染器仍不能接收来源凭据。 */
+interface AuthenticatedPageRenderer : PageRenderer {
+    suspend fun renderAuthenticated(
+        url: String,
+        headers: Map<String, String>,
+        userAgent: String?,
+        session: com.radium.inkwell.core.source.auth.SourceRequestSession,
+    ): FetchedPage?
+}

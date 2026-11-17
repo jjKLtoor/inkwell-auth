@@ -60,6 +60,15 @@ class BookSourceEngineTest {
         assertEquals(2, result.items.size)
     }
 
+    @Test fun 搜索列表前导减号按语法反转且不污染JSONPath() = runBlocking {
+        val src = source().copy(searchUrl = "/search", ruleSearch = SearchRuleSet(
+            bookList = "-@JSon:$.data", name = "$.name", bookUrl = base + "/book/{$.id}"))
+        server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest) = MockResponse().setBody("""{"data":[{"name":"甲","id":"one"},{"name":"乙","id":"two"}]}""") }
+        val result = engine().search(src, "fixture").items
+        assertEquals(listOf("乙", "甲"), result.map { it.title })
+        assertEquals(listOf(base + "/book/two", base + "/book/one"), result.map { it.bookUrl })
+    }
+
     // ---- 全链路 ----
 
     @Test

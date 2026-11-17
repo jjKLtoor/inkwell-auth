@@ -35,6 +35,7 @@ internal fun SourceCookieScreen(
     var value by remember { mutableStateOf("") }
     var showValue by remember { mutableStateOf(false) }
     val cookies = state.restored?.cookies.orEmpty()
+    val nameCounts = remember(cookies) { cookies.groupingBy { it.name }.eachCount() }
     AppScaffold(modifier = Modifier.topBarScroll(scroll), containerColor = color, topBar = {
         AppTopBar("已保存 Cookie", scroll, onBack = onBack, containerColor = color,
             actions = { AppTextButton("刷新", enabled = !state.busy, onClick = onRefresh) })
@@ -50,7 +51,9 @@ internal fun SourceCookieScreen(
                 SettingGroup {
                     SettingBlock {
                         Text(cookie.name, style = MiuixTheme.textStyles.body1)
-                        Text(cookie.domain + cookie.path, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        Text("域名：" + cookie.domain, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        Text("路径：" + cookie.path, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        if ((nameCounts[cookie.name] ?: 0) > 1) Text("同名项的域名或路径不同，分别生效", style = MiuixTheme.textStyles.footnote1)
                         Text(cookieAttributes(cookie), style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         if (key in revealed) SelectionContainer {
                             Text(cookie.value.ifEmpty { "（空值）" }, style = MiuixTheme.textStyles.footnote1,

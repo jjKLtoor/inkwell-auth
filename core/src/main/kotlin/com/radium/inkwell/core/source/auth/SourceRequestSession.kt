@@ -10,6 +10,10 @@ interface SourceRequestSession : CookieJar {
     val active: Boolean
     val hasCredentials: Boolean
     val loginData: MutableMap<String, String>
+    /** 仅供隔离渲染器恢复完整 Cookie 元数据，默认不授权旧实现导出身份。 */
+    fun cookiesForRendering(): List<okhttp3.Cookie> = emptyList()
+    /** 隔离渲染结束后的乐观合并；实现须拒绝覆盖并发更新或已撤销的身份。 */
+    fun mergeRenderedCookies(original: List<okhttp3.Cookie>, current: List<okhttp3.Cookie>, observed: List<okhttp3.HttpUrl>) {}
     suspend fun flush()
 
     companion object {
