@@ -154,7 +154,7 @@ class SourceChecker(
         var step = CheckStep.SEARCH
         return runCatching {
             withTimeout(opts.timeoutMs) {
-                val hit = engine.search(rule, opts.keyword).items.firstOrNull()
+                val hit = engine.search(rule, com.radium.inkwell.data.source.sourceTestKeyword(rule, opts.keyword)).items.firstOrNull()
                     ?: throw CheckFailed("搜索无结果")
                 if (!opts.checkDetail && !opts.checkToc && !opts.checkContent) {
                     return@withTimeout ok(chars = -1, startedAt)

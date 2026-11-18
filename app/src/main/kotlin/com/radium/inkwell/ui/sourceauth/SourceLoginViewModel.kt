@@ -43,6 +43,7 @@ data class SourceLoginState(
     val form: SourceLoginForm? = null,
     val formError: Boolean = false,
     val sourceFeedback: String = "",
+    val sourceUserAgent: String? = null,
 )
 
 class SourceLoginViewModel(
@@ -78,7 +79,8 @@ class SourceLoginViewModel(
                 }.plus(listOfNotNull(source.baseUrl.toHttpUrl().takeIf { scope.permits(it.toString()) && it.username.isEmpty() && it.password.isEmpty() }?.let {
                     LoginConfiguration.WebPage(it.toString(), partial = true, home = true)
                 })).distinctBy { it.url } else emptyList()
-                mutableState.value = mutableState.value.copy(name = source.name, scope = scope, page = page, pages = pages, form = form.getOrNull(), formError = form.isFailure)
+                mutableState.value = mutableState.value.copy(name = source.name, scope = scope, page = page, pages = pages, form = form.getOrNull(), formError = form.isFailure,
+                    sourceUserAgent = source.headers.entries.firstOrNull { it.key.equals("User-Agent", true) }?.value)
                 if (scope == null || page == null && form.getOrNull() == null) {
                     fail(when (config) {
                         LoginConfiguration.NotConfigured -> "该来源未配置登录"

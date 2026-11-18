@@ -16,6 +16,34 @@ import org.junit.Test
 
 /** 真正执行 Chromium 的 Cookie 恢复与 DOM 搜索，响应为本地构造，不使用站点账号。 */
 class AuthenticatedRenderingTest {
+    @Test fun DOM未变化但数据请求仍在执行时继续等待() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val root = File(context.noBackupFilesDir, "render-idle-fixture-" + UUID.randomUUID())
+        val sessions = PersistentSourceSessions(EncryptedSessionStore(root, KeystoreSessionCipher()))
+        val source = BookSourceRule.fromJson("""{"bookSourceUrl":"https://example.com/#idle-fixture","searchUrl":"/search,{\"webView\":true}","ruleSearch":{"bookList":"li","name":"a@text","bookUrl":"a@href"}}""")
+        val scope = requireNotNull(sourceAuthScope(source))
+        val dataRequested = java.util.concurrent.atomic.AtomicBoolean()
+        val html = """<html><body><ul id="results"></ul><script>
+            fetch('/data').then(function(r){return r.text()}).then(function(s){document.getElementById('results').innerHTML=s});
+            </script></body></html>"""
+        val renderer = WebViewPageRenderer(context, authenticatedGuard = { { request ->
+            val body = if (request.url.path == "/data") {
+                dataRequested.set(true)
+                // 模拟主文档完成后仍未返回的数据；旧的 DOM 稳定判断会过早结束。
+                Thread.sleep(2000)
+                "<li><a href='/book'>fixture</a></li>"
+            } else html
+            WebResourceResponse("text/html", "UTF-8", ByteArrayInputStream(body.toByteArray()))
+        } })
+        try {
+            sessions.replace(scope, CookieSession(listOf(Cookie.Builder().name("sid").value("fixture")
+                .hostOnlyDomain("example.com").path("/").secure().expiresAt(System.currentTimeMillis() + 3600000).build())))
+            val engine = BookSourceEngine(SourceHttpClient(), renderer = renderer, sessions = sessions)
+            assertEquals("fixture", engine.search(source, "fixture").items.single().title)
+            assertTrue(dataRequested.get())
+        } finally { sessions.logout(scope); root.delete() }
+    }
+
     @Test fun 同站POST子请求被阻止但不使已取得的主文档整体失败() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val root = File(context.noBackupFilesDir, "render-post-fixture-" + UUID.randomUUID())

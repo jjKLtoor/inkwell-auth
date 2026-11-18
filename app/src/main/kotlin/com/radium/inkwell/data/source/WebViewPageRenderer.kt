@@ -56,7 +56,7 @@ class WebViewPageRenderer(
                 withTimeout(timeoutMs) {
                     isolated.prepare()
                     loadPage(isolated.view, url, headers, isolated)
-                    val html = awaitSettledHtml(isolated.view)
+                    val html = awaitSettledHtml(isolated.view, { isolated.networkIdle }, { isolated.networkRevision })
                     isolated.failure?.let { throw IOException(it) }
                     if (!session.active) throw IOException("来源会话已退出")
                     isolated.capture()
@@ -187,18 +187,22 @@ class WebViewPageRenderer(
      * 阅读页翻到要渲染的章节时，翻页动画正好跟它抢主线程。只比长度又不够：定长的占位（补齐的「加载中…」、
      * 倒计时）换成正文前长度可能不变，会被当成已经渲染完。哈希在渲染进程里算，几十万字符一遍是几毫秒。
      */
-    private suspend fun awaitSettledHtml(wv: WebView): String {
+    private suspend fun awaitSettledHtml(wv: WebView, networkIdle: () -> Boolean = { true }, networkRevision: () -> Long = { 0 }): String {
         var last = ""
         var stable = 0
+        var lastRevision = networkRevision()
         repeat(MAX_POLLS) {
             delay(POLL_INTERVAL_MS)
             val signature = readHtmlSignature(wv)
-            if (signature.isNotEmpty() && !signature.startsWith("0:") && signature == last) {
+            val revision = networkRevision()
+            // DOM 暂时不变不能代表异步取页完成；请求期间及请求版本变化后重新观察稳定性。
+            if (networkIdle() && revision == lastRevision && signature.isNotEmpty() && !signature.startsWith("0:") && signature == last) {
                 if (++stable >= 2) return readHtml(wv).ifEmpty { throw RenderFailed("渲染后页面为空") }
             } else {
                 stable = 0
                 last = signature
             }
+            lastRevision = revision
         }
         return readHtml(wv).ifEmpty { throw RenderFailed("渲染后页面为空") }
     }
@@ -226,7 +230,7 @@ class WebViewPageRenderer(
     private companion object {
         const val POLL_INTERVAL_MS = 350L
         /** 页面签名：长度 + 整串的 31 进制滚动哈希（|0 截成 32 位整数） */
-        const val SIGNATURE_JS = "(function(){var s=document.documentElement.outerHTML,h=0;" +
+        const val SIGNATURE_JS = "(function(){if(document.readyState!=='complete')return '';var s=document.documentElement.outerHTML,h=0;" +
             "for(var i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))|0}return s.length+':'+h})()"
         const val MAX_POLLS = 24 // 与 timeoutMs 共同兜底；连续两次稳定就提前返回
     }

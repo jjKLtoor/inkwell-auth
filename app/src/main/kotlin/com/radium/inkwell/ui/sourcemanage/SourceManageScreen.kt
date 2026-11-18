@@ -372,7 +372,7 @@ fun SourceManageScreen(
                 CompactTextField(
                     value = draft.keyword,
                     onValueChange = { draft = draft.copy(keyword = it) },
-                    placeholder = "搜索关键词",
+                    placeholder = "留空使用来源校验词",
                 )
                 Text(
                     "要一个几乎每个站都搜得出结果的常见词",

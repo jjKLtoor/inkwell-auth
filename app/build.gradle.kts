@@ -171,6 +171,7 @@ dependencies {
 
     // WebView 渲染只能在真机/模拟器上验证，JVM 单测覆盖不到
     androidTestImplementation(libs.androidx.test.uiautomator)
+    androidTestImplementation(libs.jsoup)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.kotlinx.coroutines.test)

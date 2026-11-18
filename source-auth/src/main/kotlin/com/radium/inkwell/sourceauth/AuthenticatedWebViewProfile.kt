@@ -42,6 +42,13 @@ class AuthenticatedWebViewProfile private constructor(
     // profile 是唯一 Cookie 所有者；代理不得缓存响应 Cookie，再覆盖 JS 写入或匿名资源的空 Cookie。
     private val anonymous = SourceHttpClient(OkHttpClient.Builder().followSslRedirects(false).build(), useMemoryCookieJar = false)
     @Volatile private var closed = false
+    private val diagnosticFile = if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+        java.io.File(context.noBackupFilesDir, "auth-render-network-diagnostic.json") else null
+    private val diagnosticRequests = java.util.concurrent.ConcurrentLinkedQueue<org.json.JSONObject>()
+    private val pendingRequests = java.util.concurrent.atomic.AtomicInteger()
+    private val requestRevision = java.util.concurrent.atomic.AtomicLong()
+    val networkIdle: Boolean get() = pendingRequests.get() == 0
+    val networkRevision: Long get() = requestRevision.get()
     @Volatile var failure: String? = null
         private set
 
@@ -84,6 +91,41 @@ class AuthenticatedWebViewProfile private constructor(
 
     /** 只有获准 origin 使用 Chromium 的 Cookie；其他站点的 GET 资源通过无身份客户端获取。 */
     fun intercept(request: WebResourceRequest): WebResourceResponse? {
+        pendingRequests.incrementAndGet()
+        requestRevision.incrementAndGet()
+        try {
+            val result = interceptControlled(request)
+            recordDiagnostic(request, result)
+            return result
+        } finally {
+            pendingRequests.decrementAndGet()
+            requestRevision.incrementAndGet()
+        }
+    }
+
+    private fun recordDiagnostic(request: WebResourceRequest, result: WebResourceResponse?) {
+        // 只在调试包保留有限的域/状态/类型，不记录地址路径、请求头值或认证材料。
+        if (diagnosticFile != null && diagnosticRequests.size < 128) {
+            val parsed = request.url.toString().toHttpUrlOrNull()
+            diagnosticRequests.add(org.json.JSONObject().apply {
+                put("origin", parsed?.let { "${it.scheme}://${it.host}:${it.port}" }.orEmpty())
+                put("main", request.isForMainFrame)
+                put("method", request.method.takeIf { it in setOf("GET", "HEAD", "POST", "OPTIONS") } ?: "OTHER")
+                put("status", result?.statusCode ?: 0)
+                put("blocked", result?.reasonPhrase in setOf("Blocked", "Forbidden"))
+                put("mime", when {
+                    result?.mimeType?.contains("javascript") == true -> "SCRIPT"
+                    result?.mimeType?.contains("html") == true -> "HTML"
+                    result?.mimeType?.contains("json") == true -> "JSON"
+                    result?.mimeType?.contains("css") == true -> "CSS"
+                    else -> "OTHER"
+                })
+                put("hasFetchMetadata", request.requestHeaders.keys.any { it.startsWith("Sec-Fetch-", true) })
+            })
+        }
+    }
+
+    private fun interceptControlled(request: WebResourceRequest): WebResourceResponse? {
         val url = request.url.toString()
         if (closed || !session.active) return denied("来源会话已退出")
         if (session.scope.permits(url)) {
@@ -159,6 +201,10 @@ class AuthenticatedWebViewProfile private constructor(
 
     private suspend fun close() = withContext(NonCancellable) {
         closed = true; proxyJob.cancel(); view.stopLoading(); view.destroy()
+        diagnosticFile?.let { file -> withContext(Dispatchers.IO) {
+            try { file.writeText(org.json.JSONObject().put("requests", org.json.JSONArray(diagnosticRequests.toList())).toString()) }
+            catch (_: IOException) { /* 调试记录失败不影响会话清理。 */ }
+        } }
         try { withTimeout(5000) { while (pendingWrites > 0) delay(10); clearData() } }
         catch (error: Exception) { poisoned = true; throw IOException("隔离渲染清理未完成，请重启应用后重试", error) }
     }

@@ -63,6 +63,8 @@ class LoginWebSession(
     val view: WebView
     val container: FrameLayout
     private var popup: WebView? = null
+    private var sourceUserAgent: String? = null
+    private var started = false
     @Volatile private var closed = false
     private var pendingCookieWrites = 0
     private var cleaning = false
@@ -111,8 +113,8 @@ class LoginWebSession(
             allowContentAccess = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             cacheMode = WebSettings.LOAD_NO_CACHE
-            // 使用当前系统 WebView 的真实标识，避免旧版固定 Chrome 标识与内核不一致。
-            userAgentString = WebSettings.getDefaultUserAgent(browser.context)
+            // 无来源声明时沿用系统标识；有明确声明则与后台取页保持一致，不另造浏览器配置。
+            userAgentString = sourceUserAgent ?: WebSettings.getDefaultUserAgent(browser.context)
             setSupportMultipleWindows(true)
             javaScriptCanOpenWindowsAutomatically = false
         }
@@ -211,8 +213,17 @@ class LoginWebSession(
         return false
     }
 
+    /** 只沿用来源明确声明的请求标识，避免登录和取页落在不同版本；不生成或修改其他浏览器指纹。 */
+    fun setSourceUserAgent(value: String?) {
+        check(!closed && !started && popup == null)
+        require(value == null || value.length <= 2048 && value.all { it in ' '..'~' }) { "来源 User-Agent 格式不受支持" }
+        sourceUserAgent = value?.takeIf { it.isNotBlank() }
+        view.settings.userAgentString = sourceUserAgent ?: WebSettings.getDefaultUserAgent(view.context)
+    }
+
     suspend fun start(url: String, restored: CookieSession?) = withContext(Dispatchers.Main) {
         check(!closed && scope.permits(url))
+        started = true
         if (popup != null) closePopup()
         restored?.cookies?.forEach { cookie ->
             suspendCancellableCoroutine { continuation ->
@@ -244,8 +255,30 @@ class LoginWebSession(
             CookieManagerCompat.getCookieInfo(cookies, url).mapNotNull { parseWebViewCookie(url.toHttpUrl(), it) }
         }
         // 临时允许的网站可能持有自己的账号 Cookie，不能顺手导出到原来源的持久认证。
-        CookieSession(records.filter { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } },
-            allowWebResources = true)
+        val retained = records.filter { cookie -> scope.originUrls.any { cookie.matches(it.toHttpUrl().newBuilder().encodedPath(cookie.path).build()) } }
+        // 仅调试包记录保存前后的作用域数量；不记录 Cookie 名称、值、路径或页面地址。
+        // 这样可以定位跳转到另一子域后材料被过滤的情况，而不扩大实际认证发送范围。
+        if (view.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            val report = org.json.JSONObject().apply {
+                put("capturedAt", System.currentTimeMillis())
+                put("capturedCount", records.size)
+                put("retainedCount", retained.size)
+                put("groups", org.json.JSONArray().apply {
+                    records.groupBy { Triple(it.domain, it.hostOnly, it in retained) }.forEach { (key, rows) ->
+                        put(org.json.JSONObject().apply {
+                            put("domain", key.first); put("hostOnly", key.second)
+                            put("retained", key.third); put("count", rows.size)
+                        })
+                    }
+                })
+            }
+            val directory = view.context.noBackupFilesDir
+            withContext(Dispatchers.IO) {
+                try { java.io.File(directory, "auth-capture-scope-diagnostic.json").writeText(report.toString()) }
+                catch (_: java.io.IOException) { /* 调试记录失败不能影响用户保存会话。 */ }
+            }
+        }
+        CookieSession(retained, allowWebResources = true)
     }
 
     /** 当前进程不能删除已加载的 profile，先销毁视图并等待其全部浏览数据清理完成。 */

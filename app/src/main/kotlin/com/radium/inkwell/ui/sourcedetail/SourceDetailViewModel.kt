@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.radium.inkwell.core.source.BookSourceEngine
 import com.radium.inkwell.data.source.DEFAULT_SOURCE_TEST_KEYWORD
 import com.radium.inkwell.data.source.probeSourceContent
+import com.radium.inkwell.data.source.sourceTestKeyword
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.data.repo.NetBookRepository
 import com.radium.inkwell.ui.components.MessageBus
@@ -51,6 +52,7 @@ class SourceDetailViewModel(
     val messages = MessageBus()
 
     private var loadedRule: com.radium.inkwell.core.source.BookSourceRule? = null
+    private var keywordEdited = false
 
     init {
         viewModelScope.launch {
@@ -72,12 +74,15 @@ class SourceDetailViewModel(
                 jsonText = pretty,
                 searchable = searchable,
                 // 不能搜索的源要的是网址，预填的搜索词留着只会被当成网址去抓
-                testKeyword = if (searchable) _state.value.testKeyword else "",
+                testKeyword = if (searchable) {
+                    if (keywordEdited) _state.value.testKeyword else rule?.let { sourceTestKeyword(it) }.orEmpty()
+                } else "",
             )
         }
     }
 
     fun setTestKeyword(text: String) {
+        keywordEdited = true
         _state.value = _state.value.copy(testKeyword = text)
     }
 

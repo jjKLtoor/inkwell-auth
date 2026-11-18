@@ -139,6 +139,8 @@ internal fun SourceLoginContent(
                     factory = { context ->
                         try {
                             val owned = sessionFactory(context, state.scope) { pageMessage = "网页加载失败，请重试" }
+                            try { owned.setSourceUserAgent(state.sourceUserAgent) }
+                            catch (error: Exception) { owned.close(); throw error }
                             owned.onDialog = { webDialog = it }
                             owned.onPageEvent = { event ->
                                 onDiagnosticEvent(event)

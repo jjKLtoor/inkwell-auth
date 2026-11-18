@@ -6,6 +6,12 @@ import com.radium.inkwell.core.source.RemoteChapterContent
 import kotlinx.coroutines.CancellationException
 
 internal const val DEFAULT_SOURCE_TEST_KEYWORD = "剑"
+
+/** 手动输入优先；自动校验应使用作者给出的可复现样本，不能用统一词误判来源不可用。 */
+internal fun sourceTestKeyword(source: com.radium.inkwell.core.source.BookSourceRule, override: String = ""): String =
+    override.trim().takeIf { it.isNotEmpty() }
+        ?: source.search?.checkKeyWord?.trim()?.takeIf { it.isNotEmpty() }
+        ?: DEFAULT_SOURCE_TEST_KEYWORD
 internal const val SHORT_SOURCE_CONTENT_CHARS = 100
 
 internal data class SourceContentProbe(val chapter: RemoteChapter, val content: RemoteChapterContent, val chars: Int)
