@@ -118,7 +118,7 @@ Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)
 | 几档里选一档（固定 2~5 档） | `SegmentedChoice`（`SegmentedChoice.kt`）：灰槽里浮起一块，选中段实心填强调色（不是白块 —— 白块在白卡上分不清）。选项多或会变的（字体、方案、七档间隔）仍用 `ChipRow` |
 | 从一排色块 / 图标里挑一个（主题色板、应用图标的图形与纸色） | `SwatchChoice`（`SwatchChoice.kt`）：52dp 的块 + 下面一行名字，选中描主色圈 + 右下角一枚勾 + 名字换主色加粗，没选中的描细分隔线（浅色块放白卡上才看得出边）；`cornerRadius` 给了是 squircle（图标预览），不给是圆形色板。整块一个单选目标、带名字（名字的 Text 在可点区外）。描边叠在内容**上面**一层画 —— Miuix 的 `squircleBorder` 画在内容底下（onDrawBehind），块里铺一张不透明的图就被整个盖住 |
 | 列表行密度 | 默认 `DefaultPadding`（= Miuix `BasicComponent`）；带封面/大图标/行尾 48dp 图标按钮的行（`BookListRow`、书架列表、`AppIconSheet`、搜索历史）用 `MediaPadding`。从前默认是上下 4dp，两三行字的行（书源、净化规则、订阅文章）挤成一片，被指出不合规范 |
-| 分段 Tab + 内容切换 | `AppTabRow` + `AppTabContent`（`AppTabs.kt`）。Tab 是 Miuix `TabRowWithContour`（灰槽里浮起一块卡片色，格子均分槽宽），高度与圆角对齐 `SegmentedChoice`；`containerColor` 是槽色，要和浮块（`surfaceContainer`）差一档。别换回 Miuix `TabRow`（一格一个描边框，像一排按钮）。调用方给左右边距，和下面的内容对齐。切换过渡横移只取 1/8 宽且**关掉 SizeTransform** —— 所以内容区**必须定高**，否则又变成「切 Tab 把面板顶高」 |
+| 分段页签的内容切换 | `AppTabContent`（`AppTabs.kt`）。页签选择器优先复用 `SegmentedChoice`，不保留没有调用者的单独页签封装。切换过渡横移只取 1/8 宽且**关掉 SizeTransform** —— 内容区**必须定高或设上限**，避免切页时面板被顶高 |
 | 设置行 / 开关行 / 选择行 / 分组小标题 | `SettingRow` / `SwitchRow` / `SpinnerSettingRow` / `SectionHeader`（`SettingRow.kt`）。`SettingRow` 就是 Miuix `ArrowPreference`（可点，行尾 ›）/ `BasicComponent`（纯展示）；`SwitchRow` 是 `BasicComponent` + 纯展示的 `Switch`，整行一个开关语义 —— **别用 Miuix `SwitchPreference`**，它是「行 + 开关」双焦点。退出登录这类操作传 `destructive = true`（红字、不带 ›、点了先确认），单独放一张卡，别和普通入口混在一组。「标题 + 当前值、点开选一个」用 `SpinnerSettingRow`（照 Miuix `WindowSpinnerPreference` 拼的那一行，选项从这一行上弹出；弹层换成和 `AppDropdownMenu` 同一个毛玻璃 `GlassDropdownPopup`，别再直接用 `WindowSpinnerPreference` —— 它的弹层写死是实色卡片）。设置主页那一列入口行带 `icon`（光秃秃的线条图标、`onSurface` 色，**不垫底板** —— 垫过淡强调色方块，被指出「图标外面套了个容器」），二级页保持纯文字 |
 | 设置分组卡 | `SettingGroup`（Miuix `Card`）+ `SettingRow(..., position = First/Middle/Last/Alone)` / `SwitchRow(..., position = …)`；底部面板里的开关行也装进 `SettingGroup`（不再「一条一卡」，见底部面板） |
 | 设置类页面骨架 | **只有一种**：灰底（`surface`）+ `SectionHeader` + `SettingGroup`（左右 16dp），控件全部装进卡里。卡里不是「行」的内容（表单、分段按钮、说明）包 `SettingBlock`；卡下的说明小字用 `SettingFootnote`。小标题、卡里的字、脚注左边在同一条竖线上 |
@@ -201,7 +201,7 @@ Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)
 ## 发布流程
 
 - 版本号**唯一来源**：`gradle/libs.versions.toml` 的 `inkwell = "x.y.z"`。CI 校验 tag 必须等于 `v$版本`。
-- 本 fork 在基础仓库上补充登录认证模块，打包版本保持与用户指定的 fork 基线一致（当前 `0.5.9`）。认证模块迭代、修复或重打包不得自行递增版本；通过文件名、提交号和说明区分构建，只有用户明确要求升级版本时才修改。先核对 fork 基线，不因认证功能进展推断应升级版本；安装由用户自行处理。
+- 本 fork 合入 `origin/main` 时，以被合入提交的 `inkwell` 配置为版本基线。合并前读取远端跟踪分支的值，合并后核对开发分支的值，打包后核对 APK 版本名和版本码。认证功能迭代通过文件名、提交号和说明区分构建。
 - 发布 = 打**附注 tag** `vx.y.z` 并推送 → 触发 `.github/workflows/release.yml`。
 - **tag 注解正文 = GitHub Release 正文 = 应用内更新弹窗内容 = 关于页点「版本」看到的内容**。CI 会自动剔掉 `Co-Authored-By`/`Signed-off-by` trailer 和 `Full Changelog`。
 - 关于页那份是打包前写进安装包的（release.yml 的「Extract tag message」把正文与 tag 日期写进 `app/src/main/assets/release/`，该目录不入库；读取见 `BundledReleaseNotes`）：所以那一步**必须在 `assembleRelease` 之前**。本地编的包没有它，弹窗里写「这个安装包没有附带更新说明」。

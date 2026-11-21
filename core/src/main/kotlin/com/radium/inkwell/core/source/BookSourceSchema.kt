@@ -154,6 +154,8 @@ data class SearchRuleSet(
     val bookUrl: String? = null,
     /** 来源作者声明的校验词只供测试入口选用，不改变用户的正常搜索。 */
     val checkKeyWord: String? = null,
+    /** 可选扩展：规则明确提取的作品更新时间。 */
+    val updateTime: String? = null,
 )
 
 /** 详情页规则（Legado ruleBookInfo）；[init] 在其余字段之前求值（常见 `@put`） */

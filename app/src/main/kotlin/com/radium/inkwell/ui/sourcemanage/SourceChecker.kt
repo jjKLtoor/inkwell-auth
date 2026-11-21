@@ -161,7 +161,7 @@ class SourceChecker(
                 }
 
                 step = CheckStep.DETAIL
-                val (detail, toc) = netBookRepo.fetchDetailAndToc(rule, hit.bookUrl, hit.variables) {
+                val (detail, toc) = netBookRepo.fetchDetailAndToc(rule, hit.bookUrl, hit.variables, trackReadHealth = false) {
                     step = CheckStep.TOC
                 }
                 if (!opts.checkToc && !opts.checkContent) return@withTimeout ok(chars = -1, startedAt)

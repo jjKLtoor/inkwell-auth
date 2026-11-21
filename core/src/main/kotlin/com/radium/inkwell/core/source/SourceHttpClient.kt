@@ -245,7 +245,8 @@ class SourceHttpClient(
                 safeLog(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
                 throw e
             }
-            if (retryTransientErrors && response.code in RETRY_CODES && attempt < MAX_RETRIES) {
+            val hasRateLimitDelay = response.code == 429 && !response.header("Retry-After").isNullOrBlank()
+            if (retryTransientErrors && response.code in RETRY_CODES && attempt < MAX_RETRIES && !hasRateLimitDelay) {
                 safeLog(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
                 response.close()
                 delay(retryBaseDelayMs shl attempt) // 指数退避：base、base*2
@@ -255,7 +256,7 @@ class SourceHttpClient(
             response.use { resp ->
                 if (throwOnHttpError && !resp.isSuccessful) {
                     safeLog(true, "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms）", null)
-                    throw IOException("HTTP ${resp.code}: $url")
+                    throw HttpStatusException(resp.code, url, resp.header("Retry-After"))
                 }
                 val bytes = try {
                     withContext(Dispatchers.IO) { readBounded(resp, url, maxResponseBytes.coerceIn(1, MAX_BODY_BYTES)) }
@@ -310,7 +311,7 @@ class SourceHttpClient(
     }
 
     /** 服务端回了错误码（不是超时、断网）：取图时据此决定要不要带 Referer 再试一次 */
-    class HttpStatusException(val code: Int, url: String) : IOException("HTTP $code: $url")
+    class HttpStatusException(val code: Int, url: String, val retryAfter: String? = null) : IOException("HTTP $code: $url")
 
     /**
      * 发请求，**取消立刻掐掉 Call**。
