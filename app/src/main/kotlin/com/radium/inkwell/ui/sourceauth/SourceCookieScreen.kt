@@ -84,7 +84,7 @@ internal fun SourceCookieScreen(
             })
     }
     deleting?.let { cookie ->
-        AppAlertDialog(title = "删除此 Cookie？", text = cookie.name + "\n删除后可能需要重新登录。",
+        AppAlertDialog(title = "删除此 Cookie？", text = cookie.name + "\n公开内容仍可访问。要清除该来源的整个会话，请使用「退出登录」。",
             confirmText = "删除", closeOnConfirm = true, onDismissRequest = { deleting = null },
             onConfirm = { onEdit(cookie, null); deleting = null; revealed = revealed - cookieKey(cookie) })
     }

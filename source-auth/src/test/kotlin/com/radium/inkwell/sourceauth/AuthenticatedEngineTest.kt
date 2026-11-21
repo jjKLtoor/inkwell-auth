@@ -20,6 +20,56 @@ import kotlin.test.*
 class AuthenticatedEngineTest {
     @get:Rule val temp = TemporaryFolder()
 
+    @Test fun 删除Cookie后旧请求头副本不能补回且匿名访问与重新登录可用() = runBlocking {
+        val serverCertificate = HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
+        val tls = HandshakeCertificates.Builder().heldCertificate(serverCertificate).build()
+        val trust = HandshakeCertificates.Builder().addTrustedCertificate(serverCertificate.certificate).build()
+        val client = OkHttpClient.Builder().sslSocketFactory(trust.sslSocketFactory(), trust.trustManager).build()
+        val http = SourceHttpClient(client, allowPrivateNetwork = true)
+        val key = KeyGenerator.getInstance("AES").generateKey()
+        val root = temp.newFolder()
+        fun newStore() = EncryptedSessionStore(root, AesGcmSessionCipher { key })
+
+        MockWebServer().use { site ->
+            site.useHttps(tls.sslSocketFactory(), false)
+            site.start()
+            val source = BookSourceRule(site.url("/").toString(), searchUrl = "/search")
+            val scope = requireNotNull(SourceAuthScope.create(source.id, source.baseUrl))
+            val headerKey = "\$loginHeader"
+            fun cookie(value: String) = requireNotNull(Cookie.parse(site.url("/"), "sid=$value; Path=/; Secure; Max-Age=3600"))
+            val sessions = PersistentSourceSessions(newStore())
+            val oldCookie = cookie("fixture-old")
+            sessions.replace(scope, CookieSession(listOf(oldCookie), mapOf(
+                headerKey to """{"cOoKiE":"sid=fixture-old; preference=kept","Authorization":"Bearer independent-fixture"}""",
+                "\$loginInfo" to """{"manualToken":"fixture-old","other":"kept"}""",
+            )))
+
+            suspend fun request(provider: PersistentSourceSessions): String? {
+                site.enqueue(MockResponse().setBody("public fixture"))
+                assertEquals("public fixture", BookSourceEngine(http, sessions = provider).fetchSearchPage(source, "test").bodyText)
+                return site.takeRequest().getHeader("Cookie")
+            }
+
+            assertEquals("sid=fixture-old", request(sessions))
+            val previous = sessions.open(scope)
+            sessions.editCookie(scope, oldCookie, null)
+            previous.saveFromResponse(site.url("/"), listOf(oldCookie))
+            previous.flush()
+            assertFalse(previous.active)
+            assertEquals("""{"other":"kept"}""", sessions.open(scope).loginData["\$loginInfo"])
+            val persistedHeader = sessions.savedSnapshot(scope)?.loginData?.get(headerKey).orEmpty()
+            assertContains(persistedHeader, "Bearer independent-fixture")
+            assertFalse(persistedHeader.contains("fixture-old"))
+            assertEquals("preference=kept", request(sessions))
+            val restarted = PersistentSourceSessions(newStore())
+            assertEquals("preference=kept", request(restarted))
+            restarted.logout(scope)
+            assertNull(request(restarted))
+            restarted.replace(scope, CookieSession(listOf(cookie("fixture-new"))))
+            assertEquals("sid=fixture-new", request(restarted))
+        }
+    }
+
     @Test fun v2旧会话仍可读取并按v3保存且不删除其他文件() = runBlocking {
         val key = KeyGenerator.getInstance("AES").generateKey()
         val cipher = AesGcmSessionCipher { key }

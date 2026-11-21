@@ -7,6 +7,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Cookie
 import okhttp3.HttpUrl
 import java.util.concurrent.ConcurrentHashMap
@@ -52,7 +55,7 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
         saved?.takeIf { it.cookies.isNotEmpty() || it.loginData.isNotEmpty() }
     }
 
-    /** 编辑只改选中 Cookie 的值或删除该条，原属性、其他 Cookie 与认证 Header 保持原样。 */
+    /** 编辑保留 Cookie 属性。删除时同步移除登录材料中可确认是同一值的副本。 */
     suspend fun editCookie(scope: SourceAuthScope, expected: Cookie, value: String?): CookieSession? = withContext(NonCancellable) { mutex.withLock {
         val old = sessions[scope]
         // 先校验，失败不撤销现有会话；冻结后迟到的网络响应不能把旧值写回。
@@ -91,8 +94,40 @@ class PersistentSourceSessions(private val store: EncryptedSessionStore) : Sourc
                 if (current.httpOnly) httpOnly()
             }.build()
         }
+        val loginData = if (replacement == null) withoutCookieCopies(session.loginData, current) else session.loginData
         return CookieSession(session.cookies.mapNotNull { if (it === current) replacement else it },
-            session.loginData, session.webOrigins, session.allowWebResources, session.loginPageUrl)
+            loginData, session.webOrigins, session.allowWebResources, session.loginPageUrl)
+    }
+
+    private fun withoutCookieCopies(data: Map<String, String>, cookie: Cookie): Map<String, String> = data.toMutableMap().apply {
+        fun rewrite(key: String, edit: (MutableMap<String, kotlinx.serialization.json.JsonElement>) -> Unit) {
+            val objectValue = this[key]?.let { raw -> runCatching { Json.parseToJsonElement(raw) as? JsonObject }.getOrNull() } ?: return
+            val fields = objectValue.toMutableMap()
+            edit(fields)
+            if (fields == objectValue) return
+            if (fields.isEmpty()) remove(key) else put(key, JsonObject(fields).toString())
+        }
+
+        // 原始 Cookie 请求头没有域与路径，只移除名称和值均相同的副本，保留其他键值对。
+        rewrite("\$loginHeader") { headers ->
+            for (name in headers.keys.filter { it.equals("Cookie", ignoreCase = true) }) {
+                val raw = (headers[name] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: continue
+                val pairs = raw.split(';')
+                val retained = pairs.filterNot { pair ->
+                    val value = pair.substringAfter('=', "").trim()
+                    '=' in pair && pair.substringBefore('=').trim() == cookie.name &&
+                        value.removeSurrounding("\"") == cookie.value.removeSurrounding("\"")
+                }
+                if (retained.size != pairs.size) {
+                    val header = retained.map(String::trim).filter(String::isNotEmpty).joinToString("; ")
+                    if (header.isEmpty()) headers.remove(name) else headers[name] = JsonPrimitive(header)
+                }
+            }
+        }
+        if (cookie.value.isNotEmpty()) rewrite("\$loginInfo") { fields ->
+            // 手动登录字段可能直接保存了同一个 Cookie 值。独立 Token 仍由「退出登录」清除。
+            fields.values.removeAll { it is JsonPrimitive && it.isString && it.content == cookie.value }
+        }
     }
 
     private fun validCookieValue(value: String): Boolean {
