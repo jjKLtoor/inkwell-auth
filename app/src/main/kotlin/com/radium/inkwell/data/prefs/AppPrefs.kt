@@ -609,6 +609,12 @@ class AppPrefs(private val context: Context) {
         }
     }.distinctUntilChanged()
 
+    suspend fun readSourceSearchPriorities(): Map<String, SourceSearchPriority> = try {
+        sourceSearchPriorities.first()
+    } catch (_: java.io.IOException) {
+        emptyMap()
+    }
+
     suspend fun setSourceSearchPriority(id: String, priority: SourceSearchPriority) {
         context.appDataStore.edit { prefs ->
             for ((level, key) in listOf(SourceSearchPriority.HIGH to Keys.SOURCE_SEARCH_HIGH, SourceSearchPriority.HIGHEST to Keys.SOURCE_SEARCH_HIGHEST)) {

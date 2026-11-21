@@ -411,11 +411,7 @@ class SearchViewModel(
             flushSearchStats()
             val enabled = try {
                 // 首轮搜索和暂停后的继续固定使用提交时的配置。
-                searchPriorities = try {
-                    appPrefs.sourceSearchPriorities.first()
-                } catch (_: java.io.IOException) {
-                    emptyMap()
-                }
+                searchPriorities = appPrefs.readSourceSearchPriorities()
                 sourceRepo.getEnabledForSwitch()
             } catch (e: CancellationException) {
                 throw e

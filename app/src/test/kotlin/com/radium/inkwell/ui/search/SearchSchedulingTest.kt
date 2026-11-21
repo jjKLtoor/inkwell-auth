@@ -6,6 +6,7 @@ import com.radium.inkwell.core.source.SearchRuleSet
 import com.radium.inkwell.core.source.SourceHttpClient
 import com.radium.inkwell.data.db.entity.CheckStatus
 import com.radium.inkwell.data.prefs.SourceSearchPriority
+import com.radium.inkwell.data.repo.AutoSourceSwitcher
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -88,6 +89,21 @@ class SearchSchedulingTest {
             val requests = List(candidates.size) { server.takeRequest(3, TimeUnit.SECONDS)?.requestUrl?.encodedPath }
             assertEquals(listOf("/HIGHEST", "/HIGH", "/DEFAULT"), requests)
         }
+    }
+
+    @Test
+    fun `手动换源先搜索标记来源且排除当前来源`() = runTest {
+        val sources = listOf(src("current"), src("default", searchMs = 100), src("highest"), src("high"), src("high-hit"))
+        val priorities = mapOf(
+            "current" to SourceSearchPriority.HIGHEST,
+            "highest" to SourceSearchPriority.HIGHEST,
+            "high" to SourceSearchPriority.HIGH,
+            "high-hit" to SourceSearchPriority.HIGH,
+        )
+        val candidates = AutoSourceSwitcher.rank(sources, exclude = "current", bookHits = mapOf("default" to true, "high-hit" to true))
+        val started = mutableListOf<String>()
+        SearchScheduling.runRound(candidates, { priorities[it.id] ?: SourceSearchPriority.DEFAULT }) { started += it.id }
+        assertEquals(listOf("highest", "high-hit", "high", "default"), started)
     }
 
     private fun src(
