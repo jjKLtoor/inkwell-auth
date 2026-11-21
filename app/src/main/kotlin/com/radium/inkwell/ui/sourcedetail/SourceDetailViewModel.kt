@@ -3,6 +3,8 @@ package com.radium.inkwell.ui.sourcedetail
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.radium.inkwell.core.source.BookSourceEngine
+import com.radium.inkwell.data.prefs.AppPrefs
+import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.data.source.DEFAULT_SOURCE_TEST_KEYWORD
 import com.radium.inkwell.data.source.probeSourceContent
 import com.radium.inkwell.data.source.sourceTestKeyword
@@ -20,7 +22,7 @@ import kotlinx.coroutines.launch
 
 /**
  * 书源详情（只读）。书源不在手机上编辑 —— 手机上编辑 JSON 体验差，规则一律靠导入。
- * 这里只做两件事：展示规则原文（只读）、跑一键全链路冒烟测试帮用户判断源好不好。
+ * 这里展示只读规则、来源的搜索偏好和全链路测试。
  */
 data class SourceDetailUiState(
     /** 库读回来了没有。没读回来时转圈；读回来了却没有这一行（[missing]）给空态，别是一片空白还能点「测试」 */
@@ -33,6 +35,8 @@ data class SourceDetailUiState(
      * 输入框改要一本书的网址，直接从详情页走起。
      */
     val searchable: Boolean = true,
+    val searchPriority: SourceSearchPriority? = null,
+    val savingPriority: Boolean = false,
     val testKeyword: String = DEFAULT_SOURCE_TEST_KEYWORD,
     val testing: Boolean = false,
     val testReport: String = "",
@@ -43,6 +47,7 @@ class SourceDetailViewModel(
     private val sourceRepo: BookSourceRepository,
     private val netBookRepo: NetBookRepository,
     private val engine: BookSourceEngine,
+    private val appPrefs: AppPrefs,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(SourceDetailUiState())
@@ -75,9 +80,32 @@ class SourceDetailViewModel(
                 searchable = searchable,
                 // 不能搜索的源要的是网址，预填的搜索词留着只会被当成网址去抓
                 testKeyword = if (searchable) {
-                    if (keywordEdited) _state.value.testKeyword else rule?.let { sourceTestKeyword(it) }.orEmpty()
+                    if (keywordEdited) _state.value.testKeyword else sourceTestKeyword(rule)
                 } else "",
             )
+            try {
+                appPrefs.sourceSearchPriorities.collect { priorities ->
+                    _state.value = _state.value.copy(searchPriority = priorities[sourceId] ?: SourceSearchPriority.DEFAULT)
+                }
+            } catch (e: java.io.IOException) {
+                _state.value = _state.value.copy(searchPriority = SourceSearchPriority.DEFAULT)
+                messages.emit("读取搜索优先级失败，请重试")
+            }
+        }
+    }
+
+    fun setSearchPriority(priority: SourceSearchPriority) {
+        if (_state.value.savingPriority || !_state.value.searchable || priority == _state.value.searchPriority) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(savingPriority = true)
+            try {
+                appPrefs.setSourceSearchPriority(sourceId, priority)
+                _state.value = _state.value.copy(searchPriority = priority)
+            } catch (e: java.io.IOException) {
+                messages.emit("保存搜索优先级失败，请重试")
+            } finally {
+                _state.value = _state.value.copy(savingPriority = false)
+            }
         }
     }
 

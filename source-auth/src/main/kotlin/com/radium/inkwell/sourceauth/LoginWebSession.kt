@@ -34,7 +34,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 /**
  * 独立的短期 profile，不操作默认 CookieManager。平台原生 profile 在交互期间可能落盘，
  * 不宣称它被应用密钥加密；退出等待清理浏览数据，下次进程删除空 profile / 异常残留，且禁止系统备份。
- * 只收集已访问 URL 可见的完整 Cookie，localStorage 只在临时 profile 使用，不导出或跨进程恢复；公网 HTTPS 跳转正常跟随，第三方 Cookie 仍关闭。
+ * 只收集已访问 URL 可见的完整 Cookie。公网 HTTPS 跳转正常跟随，独立登录窗口支持网站的跨站认证。
+ * 临时网页存储在关闭时清理，读书会话仍按来源作用域导出，不接收额外站点的身份。
  */
 @SuppressLint("RequiresFeature", "SetJavaScriptEnabled")
 class LoginWebSession(
@@ -57,7 +58,9 @@ class LoginWebSession(
     }
 
     private val profileName: String
-    private val visited = ConcurrentHashMap.newKeySet<String>()
+    // 页面与资源分别记录。图片、脚本等请求再多，也不能挤掉登录回跳和章节入口的路径。
+    private val visitedResources = ConcurrentHashMap.newKeySet<String>()
+    private val visitedPages = linkedSetOf<String>() // 仅在 Main 线程读写。
     private val cookies: android.webkit.CookieManager
     private val storage: android.webkit.WebStorage
     val view: WebView
@@ -83,7 +86,6 @@ class LoginWebSession(
             val profile = WebViewCompat.getProfile(view)
             cookies = profile.cookieManager
             storage = profile.webStorage
-            visited.add(scope.originUrl)
             profile.serviceWorkerController.serviceWorkerWebSettings.apply {
                 blockNetworkLoads = true
                 allowContentAccess = false
@@ -119,7 +121,9 @@ class LoginWebSession(
             javaScriptCanOpenWindowsAutomatically = false
         }
         browser.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
-        cookies.setAcceptThirdPartyCookies(browser, false)
+        // 正常的内嵌认证框可能由其他域提供。仅给临时登录窗口保留浏览器的跨站 Cookie 行为，
+        // 关闭时仍清理整个 profile，导出与阅读请求始终遵守已声明的来源范围。
+        cookies.setAcceptThirdPartyCookies(browser, true)
         browser.webChromeClient = object : WebChromeClient() {
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
                 if (closed || !isUserGesture || popup != null) {
@@ -147,7 +151,7 @@ class LoginWebSession(
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val url = request.url.toString()
                 if (closed || !navigation.permits(url)) { blockedEvent(url, request.isForMainFrame, loginResourceKind(url, request.isForMainFrame, request.requestHeaders)); return blocked() }
-                if (visited.size < 256) visited.add(url)
+                if (visitedResources.size < 256) visitedResources.add(url)
                 return intercept(request).also { response ->
                     if (request.isForMainFrame && response != null && response.statusCode >= 400) pageFailure("网络保护阻止了登录页面，或页面返回 HTTP " + response.statusCode)
                 }
@@ -161,11 +165,13 @@ class LoginWebSession(
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                rememberPage(url)
                 if (browser !== (popup ?: this@LoginWebSession.view)) return
                 event(LoginPageEvent.Loading)
                 url.toHttpUrlOrNull()?.let { event(LoginPageEvent.Location(it.newBuilder().encodedPath("/").query(null).fragment(null).username("").password("").build().toString())) }
             }
             override fun onPageCommitVisible(view: WebView, url: String) {
+                rememberPage(url)
                 if (browser === (popup ?: this@LoginWebSession.view) && navigation.permits(url)) event(LoginPageEvent.Visible)
             }
             override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
@@ -242,16 +248,22 @@ class LoginWebSession(
             }.also { check(it) }
             check(!closed)
         }
-        visited.add(scope.originUrl)
-        visited.add(url)
         check(!closed)
+        rememberPage(url)
         event(LoginPageEvent.Loading)
         view.loadUrl(url)
     }
 
+    private fun rememberPage(url: String) {
+        if (closed || !navigation.permits(url)) return
+        visitedPages.remove(url)
+        visitedPages.add(url)
+        if (visitedPages.size > 64) visitedPages.remove(visitedPages.first())
+    }
+
     suspend fun capture(): CookieSession = withContext(Dispatchers.Main) {
         check(!closed)
-        val records = visited.flatMap { url ->
+        val records = (visitedPages + scope.originUrl + visitedResources).flatMap { url ->
             CookieManagerCompat.getCookieInfo(cookies, url).mapNotNull { parseWebViewCookie(url.toHttpUrl(), it) }
         }
         // 临时允许的网站可能持有自己的账号 Cookie，不能顺手导出到原来源的持久认证。

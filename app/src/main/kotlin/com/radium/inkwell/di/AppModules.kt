@@ -161,7 +161,7 @@ val appModule = module {
     // 整本缓存同理：离开详情页照常跑
     single { com.radium.inkwell.data.repo.OfflineDownloader(get(), get(), get(), get(), get()) }
     viewModel { SourceManageViewModel(androidContext(), get(), get(), get()) }
-    viewModel { (sourceId: String) -> SourceDetailViewModel(sourceId, get(), get(), get()) }
+    viewModel { (sourceId: String) -> SourceDetailViewModel(sourceId, get(), get(), get(), get()) }
     single {
         com.radium.inkwell.sourceauth.EncryptedSessionStore(
             java.io.File(androidContext().noBackupFilesDir, "source-auth"),

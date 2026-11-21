@@ -20,6 +20,42 @@ import org.junit.runner.RunWith
 /** 使用实际 Chromium profile 和完整 Cookie API；只做本地夹具，不访问真实账号或网站。 */
 @RunWith(AndroidJUnit4::class)
 class LoginWebSessionTest {
+    @Test fun 同站独立登录页返回后仅保存阅读来源能使用的Cookie() = runBlocking {
+        withContext(Dispatchers.Main) {
+            assumeTrue(LoginWebSession.supported())
+            val context = InstrumentationRegistry.getInstrumentation().targetContext
+            val entry = "https://m.example.com/"
+            val scope = requireNotNull(SourceAuthScope.create("top-level-fixture", "https://reader.example.com/", listOf(entry)))
+            val session = LoginWebSession(context, scope, { request ->
+                val script = when (request.url.host) {
+                    "m.example.com" -> """
+                        Promise.all(Array.from({length: 270}, (_, i) => fetch('/assets/' + i)))
+                            .then(() => location.assign('https://passport.example.com/'));
+                    """.trimIndent()
+                    "passport.example.com" -> """
+                        document.cookie='shared=fixture; Domain=example.com; Path=/; Secure; Max-Age=60';
+                        document.cookie='passportOnly=fixture; Path=/; Secure; Max-Age=60';
+                        location.replace('https://reader.example.com/after-login');
+                    """.trimIndent()
+                    else -> "document.cookie='callback=fixture; Path=/after-login; Secure; Max-Age=60'"
+                }
+                android.webkit.WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream("<html><script>$script</script></html>".toByteArray()))
+            }, {})
+            val manager = WebViewCompat.getProfile(session.view).cookieManager
+            try {
+                session.start(entry, null)
+                kotlinx.coroutines.withTimeout(10000) {
+                    val callback = "https://reader.example.com/after-login"
+                    while (session.view.url != callback || CookieManagerCompat.getCookieInfo(manager, callback).none { it.startsWith("callback=") }) {
+                        kotlinx.coroutines.delay(100)
+                    }
+                }
+                assertTrue(CookieManagerCompat.getCookieInfo(manager, "https://passport.example.com/").any { it.startsWith("passportOnly=") })
+                assertEquals(setOf("shared", "callback"), session.capture().cookies.map { it.name }.toSet())
+            } finally { session.close().await() }
+        }
+    }
+
     @Test fun 跨站页面自动加载但额外站点自己的Cookie不导出且关闭后清理() = runBlocking {
         withContext(Dispatchers.Main) {
             assumeTrue(LoginWebSession.supported())

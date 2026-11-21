@@ -1,12 +1,18 @@
 package com.radium.inkwell.ui.search
 
 import com.radium.inkwell.data.db.entity.CheckStatus
+import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
 import com.radium.inkwell.data.repo.TitleMatch
 import kotlin.math.abs
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 /** 单个书源这一次搜索的结局；取消不算结局（不计入测速），由调用方原样往外抛 */
 internal sealed interface SearchOutcome {
@@ -60,6 +66,19 @@ internal object SearchScheduling {
 
     /** 书源总共就这么几个时不提前结束：省不了多少时间，反倒让人以为没搜完 */
     const val EARLY_STOP_MIN_SOURCES = 20
+
+    fun <T> priorityGroups(sources: List<T>, priority: (T) -> SourceSearchPriority): List<List<T>> {
+        val groups = sources.groupBy(priority)
+        return SourceSearchPriority.entries.asReversed().mapNotNull(groups::get)
+    }
+
+    /** 前一档全部收尾才向下一档发请求；档内依旧按原队列并发。 */
+    suspend fun <T> runRound(sources: List<T>, priority: (T) -> SourceSearchPriority, search: suspend (T) -> Unit) = coroutineScope {
+        val limiter = Semaphore(CONCURRENCY)
+        for (group in priorityGroups(sources, priority)) {
+            group.map { source -> async { limiter.withPermit { search(source) } } }.awaitAll()
+        }
+    }
 
     /** 排队顺序：没被降级的在前；同档按估计耗时从快到慢；再同则保持书源管理里的手动顺序（稳定排序） */
     fun order(sources: List<EnabledSource>, now: Long = System.currentTimeMillis()): List<EnabledSource> {

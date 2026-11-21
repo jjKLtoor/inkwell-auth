@@ -24,10 +24,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.ui.components.CollectMessages
 import com.radium.inkwell.ui.components.CompactTextField
 import com.radium.inkwell.ui.components.SettingGroup
 import com.radium.inkwell.ui.components.SettingBlock
+import com.radium.inkwell.ui.components.PickerOption
+import com.radium.inkwell.ui.components.SpinnerSettingRow
 import com.radium.inkwell.ui.components.SectionHeader
 import com.radium.inkwell.ui.components.Dimens
 import com.radium.inkwell.ui.components.SecondaryButton
@@ -103,6 +106,16 @@ fun SourceDetailScreen(
                 SettingBlock {
                     SecondaryButton(text = "登录与会话", onClick = onLogin, modifier = Modifier.fillMaxWidth())
                 }
+            }
+            if (state.searchable) {
+                SectionHeader("搜索")
+                SpinnerSettingRow(
+                    title = "搜索优先级",
+                    options = SourceSearchPriority.entries.map { PickerOption(it.name, it.label) },
+                    selectedId = state.searchPriority?.name,
+                    onSelect = { viewModel.setSearchPriority(SourceSearchPriority.valueOf(it.id)) },
+                    enabled = state.searchPriority != null && !state.savingPriority,
+                )
             }
             // 控件装进卡里（设置类页面的骨架）：输入框的底是卡上的那一档，直接铺在灰底上几乎看不出框
             SectionHeader("全链路测试")

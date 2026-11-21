@@ -8,8 +8,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.mozilla.javascript.CompilerEnvirons
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.Parser
+import org.mozilla.javascript.Token
+import org.mozilla.javascript.ast.AstNode
 import org.mozilla.javascript.ast.FunctionCall
+import org.mozilla.javascript.ast.InfixExpression
 import org.mozilla.javascript.ast.Name
+import org.mozilla.javascript.ast.ParenthesizedExpression
 import org.mozilla.javascript.ast.PropertyGet
 import org.mozilla.javascript.ast.StringLiteral
 import java.net.URI
@@ -54,7 +58,7 @@ private fun parseWebLoginTargets(source: BookSourceRule): List<WebLoginTarget> {
                 val method = node.target as? PropertyGet
                 if ((method?.target as? Name)?.identifier == "java" &&
                     method.property.identifier in setOf("startBrowser", "startBrowserAwait")) {
-                    (node.arguments.firstOrNull() as? StringLiteral)?.value?.let(targets::add)
+                    node.arguments.firstOrNull()?.let { staticUrl(it, source.id) }?.let(targets::add)
                 }
             }
             true
@@ -68,6 +72,25 @@ private fun parseWebLoginTargets(source: BookSourceRule): List<WebLoginTarget> {
     val foreign = targets.map { it.url.toHttpUrlOrNull()!!.newBuilder().encodedPath("/").query(null).fragment(null).build().toString() }.filter { it != primary }.distinct()
     // 候选项可有多条路径，但不能悄悄突破来源＋一个声明登录站点的认证边界。
     return if (foreign.size <= 1) targets.distinctBy { it.url } else emptyList()
+}
+
+/** 仅求值字符串常量和来源 URL 拼接，不执行任何来源脚本。 */
+private fun staticUrl(node: AstNode, sourceUrl: String, depth: Int = 0): String? {
+    if (depth == 32) return null
+    return when (node) {
+        is StringLiteral -> node.value
+        is ParenthesizedExpression -> staticUrl(node.expression, sourceUrl, depth + 1)
+        is PropertyGet -> sourceUrl.takeIf {
+            (node.target as? Name)?.identifier == "source" && node.property.identifier == "bookSourceUrl"
+        }
+        is InfixExpression -> {
+            if (node.operator != Token.ADD) return null
+            val left = staticUrl(node.left, sourceUrl, depth + 1) ?: return null
+            val right = staticUrl(node.right, sourceUrl, depth + 1) ?: return null
+            left + right
+        }
+        else -> null
+    }
 }
 
 private fun normalizeTarget(source: BookSourceRule, declared: String, scripted: Boolean): WebLoginTarget? {

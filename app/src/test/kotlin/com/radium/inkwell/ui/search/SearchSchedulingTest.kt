@@ -1,9 +1,22 @@
 package com.radium.inkwell.ui.search
 
 import com.radium.inkwell.core.source.BookSourceRule
+import com.radium.inkwell.core.source.BookSourceEngine
 import com.radium.inkwell.core.source.SearchRuleSet
+import com.radium.inkwell.core.source.SourceHttpClient
 import com.radium.inkwell.data.db.entity.CheckStatus
+import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -14,6 +27,68 @@ import kotlin.test.assertTrue
  * 3 秒出来还是 3 分钟出来 —— 坏源排在前面、统一等满 30 秒，就是从前「书源一多搜索就慢」的主要原因。
  */
 class SearchSchedulingTest {
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `高档实际执行完成前不启动低档并保留同档顺序`() = runTest {
+        val defaults = listOf("default-b", "default-a")
+        val levels = mapOf("highest-b" to SourceSearchPriority.HIGHEST, "highest-a" to SourceSearchPriority.HIGHEST, "high" to SourceSearchPriority.HIGH)
+        val started = mutableListOf<String>()
+        val highestGate = CompletableDeferred<Unit>()
+        val highGate = CompletableDeferred<Unit>()
+        val round = launch {
+            SearchScheduling.runRound(defaults + listOf("highest-b", "high", "highest-a"), { levels[it] ?: SourceSearchPriority.DEFAULT }) { id ->
+                started += id
+                if (id.startsWith("highest")) highestGate.await()
+                if (id == "high") highGate.await()
+            }
+        }
+        runCurrent()
+        assertEquals(listOf("highest-b", "highest-a"), started)
+        highestGate.complete(Unit)
+        runCurrent()
+        assertEquals(listOf("highest-b", "highest-a", "high"), started)
+        highGate.complete(Unit)
+        round.join()
+        assertEquals(listOf("highest-b", "highest-a", "high", "default-b", "default-a"), started)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `暂停时低档不启动且同档仍受并发上限约束`() = runTest {
+        val started = mutableListOf<Int>()
+        val gate = CompletableDeferred<Unit>()
+        val round = launch {
+            SearchScheduling.runRound((0..20).toList(), { if (it < 20) SourceSearchPriority.HIGH else SourceSearchPriority.DEFAULT }) { id ->
+                started += id
+                gate.await()
+            }
+        }
+        runCurrent()
+        assertEquals((0 until SearchScheduling.CONCURRENCY).toList(), started)
+        round.cancelAndJoin()
+        assertEquals((0 until SearchScheduling.CONCURRENCY).toList(), started)
+    }
+
+    @Test
+    fun `实际搜索请求按档位抵达服务器`() = runBlocking {
+        MockWebServer().use { server ->
+            val engine = BookSourceEngine(SourceHttpClient(allowPrivateNetwork = true))
+            val candidates = listOf(SourceSearchPriority.DEFAULT, SourceSearchPriority.HIGH, SourceSearchPriority.HIGHEST).map { level ->
+                val rule = src(server.url("/").toString()).rule.copy(
+                    searchUrl = "/${level.name}?q={{key}}",
+                    ruleSearch = SearchRuleSet(bookList = "div.item", name = "span@text", bookUrl = "a@href"),
+                )
+                server.enqueue(MockResponse().setBody("<div class='item'><span class='t'>回归</span><a class='u' href='/book'>书</a></div>"))
+                rule to level
+            }
+            SearchScheduling.runRound(candidates, { it.second }) { (rule, _) ->
+                assertEquals(1, engine.search(rule, "回归").items.size)
+            }
+            val requests = List(candidates.size) { server.takeRequest(3, TimeUnit.SECONDS)?.requestUrl?.encodedPath }
+            assertEquals(listOf("/HIGHEST", "/HIGH", "/DEFAULT"), requests)
+        }
+    }
 
     private fun src(
         id: String,

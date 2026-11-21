@@ -15,6 +15,7 @@ import com.radium.inkwell.data.repo.AutoSourceSwitcher
 import com.radium.inkwell.data.repo.BookRepository
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
+import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.data.repo.NetBookRepository
 import com.radium.inkwell.data.repo.TitleMatch
 import com.radium.inkwell.ui.bookshelf.revealsHiddenBook
@@ -26,9 +27,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -41,9 +39,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.koin.core.component.KoinComponent
@@ -183,6 +179,10 @@ class SearchViewModel(
     private val pendingIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val moreAcc = java.util.Collections.synchronizedList(mutableListOf<BookSourceRule>())
     private var roundRules: List<BookSourceRule> = emptyList()
+    private var searchPriorities: Map<String, SourceSearchPriority> = emptyMap()
+
+    private fun searchPriority(rule: BookSourceRule): SourceSearchPriority =
+        searchPriorities[rule.id] ?: SourceSearchPriority.DEFAULT
     private var inFlightPage: Int = 1
     private val doneCounter = AtomicInteger(0)
     /** 每一轮搜索 +1。被 cancel 的旧协程 finally 里不许再动下一轮的 pending / moreAcc */
@@ -410,6 +410,12 @@ class SearchViewModel(
             // 上一轮被新搜索打断时没走到收尾，它测到的速度在这里落库
             flushSearchStats()
             val enabled = try {
+                // 首轮搜索和暂停后的继续固定使用提交时的配置。
+                searchPriorities = try {
+                    appPrefs.sourceSearchPriorities.first()
+                } catch (_: java.io.IOException) {
+                    emptyMap()
+                }
                 sourceRepo.getEnabledForSwitch()
             } catch (e: CancellationException) {
                 throw e
@@ -423,7 +429,9 @@ class SearchViewModel(
             sourceMetaById = enabled.associateBy { it.rule.id }
             // 快的、活的先发，坏源排到最后（见 SearchScheduling）。从前按书源管理里的手动顺序发，
             // 一个吊死的源排在前面就占着一个并发名额等满超时，健康的源在后面干等
-            val searchable = SearchScheduling.order(withLiveSpeed(enabled.filter { it.rule.search != null }))
+            val searchable = SearchScheduling.priorityGroups(withLiveSpeed(enabled.filter { it.rule.search != null })) {
+                searchPriority(it.rule)
+            }.flatMap { SearchScheduling.order(it) }
             val rules = searchable.map { it.rule }
             if (rules.isEmpty()) {
                 _state.update { it.copy(searching = false) }
@@ -547,44 +555,41 @@ class SearchViewModel(
         page: Int,
         searchId: Int,
         countProgress: Boolean,
-    ) = coroutineScope {
+    ) {
         val gen = ++roundGen
         roundRules = rules.toList()
         pendingIds.clear()
         pendingIds.addAll(roundRules.map { it.id })
-        val limiter = Semaphore(SearchScheduling.CONCURRENCY)
-        roundRules.map { rule ->
-            async {
-                try {
-                    limiter.withPermit {
-                        val pageResult = searchPage(rule, keyword, page)
-                        if (_state.value.searchId != searchId || gen != roundGen) return@withPermit
-                        val items = pageResult?.items.orEmpty()
-                        val changed = hitsMutex.withLock {
-                            if (gen != roundGen) return@withLock false
-                            merge(items)
-                        }
-                        if (gen != roundGen) return@withPermit
-                        if (pageHistory.canContinue(rule.id, pageResult)) moreAcc += rule
-                        if (countProgress) {
-                            doneCounter.incrementAndGet()
-                            // 进度随节流发布一起刷（见 schedulePublish）：从前每回来一个源就 copy 一次整份状态，
-                            // 几百个源就是几百次整页重组，边搜边滑会掉帧
-                            schedulePublish(keyword, searchId)
-                            if (earlyStopArmed && exactMatches?.record(rule, items) == true) {
-                                // 最后一个源不暂停，照常收尾并保留加载更多。
-                                pendingIds.remove(rule.id)
-                                if (pendingIds.isNotEmpty()) stopEarly()
-                            }
-                        } else if (changed) {
-                            schedulePublish(keyword, searchId)
-                        }
-                    }
-                } finally {
-                    if (gen == roundGen) pendingIds.remove(rule.id)
+        SearchScheduling.runRound(roundRules, { rule ->
+            if (page == 1) searchPriority(rule) else SourceSearchPriority.DEFAULT
+        }) { rule ->
+            try {
+                val pageResult = searchPage(rule, keyword, page)
+                if (_state.value.searchId != searchId || gen != roundGen) return@runRound
+                val items = pageResult?.items.orEmpty()
+                val changed = hitsMutex.withLock {
+                    if (gen != roundGen) return@withLock false
+                    merge(items)
                 }
+                if (gen != roundGen) return@runRound
+                if (pageHistory.canContinue(rule.id, pageResult)) moreAcc += rule
+                if (countProgress) {
+                    doneCounter.incrementAndGet()
+                    // 进度随节流发布一起刷，避免单个来源结束就触发整页重组。
+                    schedulePublish(keyword, searchId)
+                    val matched = earlyStopArmed && exactMatches?.record(rule, items) == true
+                    // 用户明确优先执行的来源全部完成后，才允许原有的提前结束。
+                    if (matched && searchPriority(rule) == SourceSearchPriority.DEFAULT) {
+                        pendingIds.remove(rule.id)
+                        if (pendingIds.isNotEmpty()) stopEarly()
+                    }
+                } else if (changed) {
+                    schedulePublish(keyword, searchId)
+                }
+            } finally {
+                if (gen == roundGen) pendingIds.remove(rule.id)
             }
-        }.awaitAll()
+        }
     }
 
     private suspend fun finishRound(

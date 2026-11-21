@@ -23,6 +23,13 @@ class WebLoginTargetTest {
         assertNull(webLoginTarget(source.copy(loginUrl = "java.startBrowser('https://one.test');java.startBrowser('https://two.test')")))
     }
 
+    @Test fun 识别静态拼接的登录地址但不执行动态脚本() {
+        val source = BookSourceRule("https://example.com/", loginUrl = "java.startBrowserAwait((source.bookSourceUrl + 'auth') + '/sign-in')")
+        assertEquals("https://example.com/auth/sign-in", webLoginTarget(source)?.url)
+        assertNull(webLoginTarget(source.copy(loginUrl = "java.startBrowser(source.bookSourceUrl + getLoginPath())")))
+        assertNull(webLoginTarget(source.copy(loginUrl = "java.startBrowser('https://' + source.bookSourceName)")))
+    }
+
     @Test fun 仅增加声明的登录origin且域名变化产生不同身份() {
         val source = BookSourceRule("https://reader.example.com", loginUrl = "https://login.example.com/member")
         val scope = assertNotNull(sourceAuthScope(source))

@@ -263,6 +263,6 @@ internal fun SourceLoginContent(
     if (showHelp) AppAlertDialog(
         title = "网页登录", onDismissRequest = { showHelp = false }, confirmText = "知道了",
         onConfirm = { showHelp = false }, closeOnConfirm = true, dismissText = null,
-        text = "不保存密码，只保存可恢复的来源 Cookie。网页及公开 HTTPS 跳转会自动加载，当前站点显示在网页上方。私网、无效证书和第三方 Cookie 仍受限制；网页登录的访问范围不会扩大阅读请求的认证范围。保存后恢复所选入口和 Cookie。",
+        text = "账号密码在网站页面输入。公开 HTTPS 跳转与跨站认证框可在临时登录窗口正常加载。确认网站页面已切换到账号状态后，再保存来源范围内的会话。关闭窗口时会清理临时网页数据。",
     )
 }

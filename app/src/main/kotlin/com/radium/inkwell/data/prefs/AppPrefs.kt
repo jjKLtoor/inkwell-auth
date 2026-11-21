@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.radium.inkwell.ui.bookshelf.BookshelfLayout
 import com.radium.inkwell.ui.bookshelf.ShelfColumns
@@ -68,6 +69,8 @@ class AppPrefs(private val context: Context) {
         val BOOKSHELF_COLUMNS = intPreferencesKey("bookshelf_columns")
         val HIDDEN_REQUIRE_AUTH = booleanPreferencesKey("hidden_require_auth")
         val SEARCH_HISTORY_ENABLED = booleanPreferencesKey("search_history_enabled")
+        val SOURCE_SEARCH_HIGH = stringSetPreferencesKey("source_search_high")
+        val SOURCE_SEARCH_HIGHEST = stringSetPreferencesKey("source_search_highest")
         /** 搜索历史，新的在前，换行分隔（关键词入库前已把换行压成空格，见 [pushSearchHistory]） */
         val SEARCH_HISTORY = stringPreferencesKey("search_history")
         /** 发现页选择器「最近」用过的书源 id，新的在前，换行分隔（id 是单行的网址，不会自带换行） */
@@ -597,6 +600,24 @@ class AppPrefs(private val context: Context) {
     val duplicateHintEnabledState: StateFlow<Boolean?> = duplicateHintEnabled.warm()
     val autoCheckUpdateState: StateFlow<Boolean?> = autoCheckUpdate.warm()
     val searchHistoryEnabledState: StateFlow<Boolean?> = searchHistoryEnabled.warm()
+
+    /** 本机的调度偏好。按来源 ID 保存，导入新版规则时沿用，普通规则文件不包含此设置。 */
+    val sourceSearchPriorities: Flow<Map<String, SourceSearchPriority>> = context.appDataStore.data.map { prefs ->
+        buildMap {
+            prefs[Keys.SOURCE_SEARCH_HIGH].orEmpty().forEach { put(it, SourceSearchPriority.HIGH) }
+            prefs[Keys.SOURCE_SEARCH_HIGHEST].orEmpty().forEach { put(it, SourceSearchPriority.HIGHEST) }
+        }
+    }.distinctUntilChanged()
+
+    suspend fun setSourceSearchPriority(id: String, priority: SourceSearchPriority) {
+        context.appDataStore.edit { prefs ->
+            for ((level, key) in listOf(SourceSearchPriority.HIGH to Keys.SOURCE_SEARCH_HIGH, SourceSearchPriority.HIGHEST to Keys.SOURCE_SEARCH_HIGHEST)) {
+                val ids = prefs[key].orEmpty()
+                val next = if (priority == level) ids + id else ids - id
+                if (next.isEmpty()) prefs.remove(key) else prefs[key] = next
+            }
+        }
+    }
     val bookshelfLayoutState: StateFlow<BookshelfLayout?> = bookshelfLayout.warm()
     val bookshelfColumnsState: StateFlow<Int?> = bookshelfColumns.warm()
     val cacheAutoPruneDaysState: StateFlow<Int?> = cacheAutoPruneDays.warm()
@@ -621,6 +642,10 @@ class AppPrefs(private val context: Context) {
         /** 关闭 / 7 / 14 / 30 天 */
         val CACHE_AUTO_PRUNE_DAYS_OPTIONS = setOf(0, 7, 14, 30)
     }
+}
+
+enum class SourceSearchPriority(val label: String) {
+    DEFAULT("默认"), HIGH("优先"), HIGHEST("最高"),
 }
 
 private fun decodeSearchHistory(raw: String?): List<String> =
