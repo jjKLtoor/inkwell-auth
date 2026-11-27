@@ -27,9 +27,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -42,9 +39,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.koin.core.component.KoinComponent
@@ -180,6 +175,7 @@ class SearchViewModel(
     private val pendingIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val moreAcc = java.util.Collections.synchronizedList(mutableListOf<BookSourceRule>())
     private var roundRules: List<BookSourceRule> = emptyList()
+    private var prioritizedSourceIds: Set<String> = emptySet()
     private var inFlightPage: Int = 1
     private val doneCounter = AtomicInteger(0)
     /** 每一轮搜索 +1。被 cancel 的旧协程 finally 里不许再动下一轮的 pending / moreAcc */
@@ -420,6 +416,9 @@ class SearchViewModel(
             // 上一轮被新搜索打断时没走到收尾，它测到的速度在这里落库
             flushSearchStats()
             val enabled = try {
+                val priorities = appPrefs.searchPriorities.first()
+                val books = if (priorities.enabled && priorities.bookIds.isNotEmpty()) bookRepo.books.first() else emptyList()
+                prioritizedSourceIds = SearchScheduling.prioritizedIds(priorities, keyword, books)
                 sourceRepo.getEnabledForSwitch()
             } catch (e: CancellationException) {
                 throw e
@@ -433,7 +432,9 @@ class SearchViewModel(
             sourceMetaById = enabled.associateBy { it.rule.id }
             // 快的、活的先发，坏源排到最后（见 SearchScheduling）。从前按书源管理里的手动顺序发，
             // 一个吊死的源排在前面就占着一个并发名额等满超时，健康的源在后面干等
-            val searchable = SearchScheduling.order(withLiveSpeed(enabled.filter { it.rule.search != null }))
+            val searchable = SearchScheduling.phases(withLiveSpeed(enabled.filter { it.rule.search != null })) {
+                it.rule.id in prioritizedSourceIds
+            }.flatMap { SearchScheduling.order(it) }
             val rules = searchable.map { it.rule }
             if (rules.isEmpty()) {
                 _state.update { it.copy(searching = false) }
@@ -558,46 +559,43 @@ class SearchViewModel(
         page: Int,
         searchId: Int,
         countProgress: Boolean,
-    ) = coroutineScope {
+    ) {
         val gen = ++roundGen
         roundRules = rules.toList()
         pendingIds.clear()
         pendingIds.addAll(roundRules.map { it.id })
-        val limiter = Semaphore(SearchScheduling.CONCURRENCY)
         val normalizedKeyword = normalizeSearchMatch(keyword)
-        roundRules.map { rule ->
-            async {
-                try {
-                    limiter.withPermit {
-                        val pageResult = searchPage(rule, keyword, page, searchId)
-                        if (_state.value.searchId != searchId || gen != roundGen) return@withPermit
-                        val readyAt = nowMs()
-                        val items = pageResult?.matchingResults(normalizedKeyword).orEmpty()
-                        hitsMutex.withLock {
-                            if (gen != roundGen) return@withLock
-                            if (items.isNotEmpty() && firstMatchReadyAt == null) firstMatchReadyAt = readyAt
-                            merge(items)
-                        }
-                        if (gen != roundGen) return@withPermit
-                        if (pageHistory.canContinue(rule.id, pageResult)) moreAcc += rule
-                        if (countProgress) {
-                            if (pageResult != null) {
-                                recordStatus(if (items.isEmpty()) SearchStatus.EMPTY else SearchStatus.MATCHES)
-                            }
-                            doneCounter.incrementAndGet()
-                            schedulePublish(keyword, searchId)
-                            if (earlyStopArmed && exactMatches?.record(rule, items.keys) == true) {
-                                // 最后一个源不暂停，照常收尾并保留加载更多。
-                                pendingIds.remove(rule.id)
-                                if (pendingIds.isNotEmpty()) stopEarly()
-                            }
-                        }
-                    }
-                } finally {
-                    if (gen == roundGen) pendingIds.remove(rule.id)
+        val prioritized = if (page == 1) prioritizedSourceIds else emptySet()
+        SearchScheduling.runPhases(roundRules, { it.id in prioritized }) { rule ->
+            try {
+                val pageResult = searchPage(rule, keyword, page, searchId)
+                if (_state.value.searchId != searchId || gen != roundGen) return@runPhases
+                val readyAt = nowMs()
+                val items = pageResult?.matchingResults(normalizedKeyword).orEmpty()
+                hitsMutex.withLock {
+                    if (gen != roundGen) return@withLock
+                    if (items.isNotEmpty() && firstMatchReadyAt == null) firstMatchReadyAt = readyAt
+                    merge(items)
                 }
+                if (gen != roundGen) return@runPhases
+                if (pageHistory.canContinue(rule.id, pageResult)) moreAcc += rule
+                if (countProgress) {
+                    if (pageResult != null) {
+                        recordStatus(if (items.isEmpty()) SearchStatus.EMPTY else SearchStatus.MATCHES)
+                    }
+                    doneCounter.incrementAndGet()
+                    schedulePublish(keyword, searchId)
+                    val matched = earlyStopArmed && exactMatches?.record(rule, items.keys) == true
+                    if (matched && rule.id !in prioritized) {
+                        // 提前结束只适用于普通阶段，不跳过用户已标记的来源。
+                        pendingIds.remove(rule.id)
+                        if (pendingIds.isNotEmpty()) stopEarly()
+                    }
+                }
+            } finally {
+                if (gen == roundGen) pendingIds.remove(rule.id)
             }
-        }.awaitAll()
+        }
     }
 
     private suspend fun finishRound(

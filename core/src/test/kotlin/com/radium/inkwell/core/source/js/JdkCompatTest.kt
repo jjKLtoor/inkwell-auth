@@ -1,9 +1,18 @@
 package com.radium.inkwell.core.source.js
 
+import com.radium.inkwell.core.source.SourceHttpClient
 import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
@@ -15,6 +24,134 @@ import kotlin.test.assertTrue
 class JdkCompatTest {
 
     private val runtime = RhinoScriptRuntime()
+
+    @Test fun UUID替身返回字符串且不暴露Java类() {
+        val script = "String(Packages.java.util.UUID.randomUUID())"
+        val first = checkNotNull(runtime.eval(script, emptyMap()))
+        assertEquals(4, java.util.UUID.fromString(first).version())
+        assertTrue(first != runtime.eval(script, emptyMap()))
+        assertEquals("undefined", runtime.eval("typeof Packages.java.util.UUID.randomUUID().getClass", emptyMap()))
+    }
+
+    @Test fun 大整数通过通用脚本入口保留精度与符号() {
+        val result = runtime.eval("""
+            importPackage(Packages.java.math);
+            var id = new BigInteger('900719925474099312345');
+            var sum = id.add(BigInteger.ONE);
+            var negative = new BigInteger('-ff', 16);
+            var roundTrip = new BigInteger(negative.toByteArray());
+            var signed = new BigInteger(1, negative.toByteArray());
+            [sum.toString(), roundTrip.toString(16), signed.toString(16),
+              BigInteger.valueOf(17).multiply(BigInteger.TEN).divide(BigInteger.valueOf(2)).toString(),
+              BigInteger.valueOf(-17).mod(BigInteger.TEN).toString(), id.compareTo(sum),
+              BigInteger.ZERO.signum(), negative.bitLength()].join('|');
+        """.trimIndent(), emptyMap())
+        assertEquals("900719925474099312346|-ff|ff01|85|3|-1|0|8", result)
+    }
+
+    @Test fun 大整数限制输入与运算结果并保持沙箱隔离() {
+        val prefix = "var Big = Packages.java.math.BigInteger; "
+        assertEquals("4096", runtime.eval(prefix + "new Big(new Array(4097).join('1'), 2).bitLength()", emptyMap()))
+        assertFails { runtime.eval(prefix + "new Big('1' + new Array(4097).join('0'), 2)", emptyMap()) }
+        assertFails { runtime.eval(prefix + "new Big(new Array(4097).join('1'), 2).add(Big.ONE)", emptyMap()) }
+        assertFails { runtime.eval(prefix + "Big.valueOf(9007199254740992)", emptyMap()) }
+        // Rhino 能看到继承的方法名，沙箱应在方法返回 Java Class 时拒绝包装。
+        assertFails { runtime.eval(prefix + "Big.ONE.getClass()", emptyMap()) }
+    }
+
+    @Test fun 大整数模幂和安全随机数遵守脚本预算() {
+        val prefix = "var Big = Packages.java.math.BigInteger; var random = new Packages.java.security.SecureRandom(); "
+        val result = runtime.eval(prefix + """
+            var bytes = random.generateSeed(32);
+            random.nextBytes(bytes);
+            var exponent = Big.valueOf(13);
+            [Big.valueOf(4).modPow(exponent, Big.valueOf(497)).toString(), bytes.length,
+             new Big(128, random).bitLength() <= 128, random.nextInt(1)].join('|');
+        """.trimIndent(), emptyMap())
+        assertEquals("445|32|true|0", result)
+        assertFails { runtime.eval(prefix + "new Big(4097, random)", emptyMap()) }
+        assertFails { runtime.eval(prefix + "random.generateSeed(4097)", emptyMap()) }
+        assertFails { runtime.eval(prefix + "random.getClass()", emptyMap()) }
+        assertFails { runtime.eval(prefix + """
+            var huge = new Big(new Array(4097).join('1'), 2);
+            Big.TEN.modPow(huge, huge);
+        """.trimIndent(), emptyMap()) }
+    }
+
+    @Test fun 内存gzip兼容字符集并保留文件访问边界() {
+        val compressed = checkNotNull(runtime.eval("""
+            var memory = new Packages.java.io.ByteArrayOutputStream();
+            var gzip = new Packages.java.util.zip.GZIPOutputStream(memory);
+            var utf8 = Packages.java.nio.charset.Charset.forName('UTF-8');
+            var bytes = new Packages.java.lang.String('!测试!').getBytes(utf8);
+            gzip.write(bytes, 1, bytes.length - 2);
+            gzip.close();
+            String(Packages.java.util.Base64.getEncoder().encodeToString(memory.toByteArray()));
+        """.trimIndent(), emptyMap()))
+        val bytes = Base64.getDecoder().decode(compressed)
+        assertEquals("测试", java.util.zip.GZIPInputStream(bytes.inputStream()).bufferedReader().use { it.readText() })
+        assertEquals("undefined", runtime.eval("typeof Packages.java.io.File", emptyMap()))
+        assertFails { runtime.eval("new Packages.java.io.ByteArrayOutputStream(4194305)", emptyMap()) }
+    }
+
+    @Test fun 二进制请求保留字节且不重发或跨作用域发送凭据() = runBlocking {
+        var count = 0
+        val fixture = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            count++
+            assertEquals("POST", request.method)
+            assertEquals(null, request.header("X-Session-Fixture"))
+            val buffer = Buffer()
+            checkNotNull(request.body).writeTo(buffer)
+            assertTrue(byteArrayOf(-1, 0, 65).contentEquals(buffer.readByteArray()))
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(403).message("Fixture")
+                .body("响应".toResponseBody()).build()
+        }.build()
+        val http = EngineJsHttp(SourceHttpClient(fixture))
+        val bindings = mapOf("java" to JavaBridge(http, JsCache(), mutableMapOf()))
+        withContext(http.bindingTo(coroutineContext[Job], "fixture", { setOf("X-Session-Fixture") }, { false })) {
+            val result = runtime.eval("""
+                var url = new Packages.java.net.URL('https://transport.example.test/submit');
+                var connection = url.openConnection();
+                connection.setRequestMethod('POST');
+                connection.setDoOutput(true);
+                connection.setRequestProperty('X-Session-Fixture', 'fixture-only');
+                var bytes = Packages.java.util.Base64.getDecoder().decode('/wBB');
+                connection.getOutputStream().write(bytes, 0, bytes.length);
+                var stream = new Packages.java.io.InputStreamReader(connection.getErrorStream(), 'UTF-8');
+                connection.getResponseCode() + ':' + stream.readLine();
+            """.trimIndent(), bindings)
+            assertEquals("403:响应", result)
+            assertFails { runtime.eval("new Packages.java.net.URL('https://127.0.0.1/')", bindings) }
+        }
+        assertEquals(1, count)
+    }
+
+    @Test fun 二进制读取保留请求作用域且不跟随跳转() = runBlocking {
+        var count = 0
+        val fixture = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            count++
+            assertEquals("GET", request.method)
+            assertEquals(null, request.body)
+            assertEquals(null, request.header("X-Session-Fixture"))
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(302).message("Fixture")
+                .header("Location", "https://other.example.test/")
+                .body("响应".toResponseBody()).build()
+        }.build()
+        val http = EngineJsHttp(SourceHttpClient(fixture))
+        val bindings = mapOf("java" to JavaBridge(http, JsCache(), mutableMapOf()))
+        withContext(http.bindingTo(coroutineContext[Job], "fixture", { setOf("X-Session-Fixture") }, { false })) {
+            val result = runtime.eval("""
+                var connection = new Packages.java.net.URL('https://transport.example.test/read').openConnection();
+                connection.setRequestProperty('X-Session-Fixture', 'fixture-only');
+                var stream = new Packages.java.io.InputStreamReader(connection.getInputStream(), 'UTF-8');
+                connection.getResponseCode() + ':' + connection.getHeaderField('Location') + ':' + stream.readLine();
+            """.trimIndent(), bindings)
+            assertEquals("302:https://other.example.test/:响应", result)
+        }
+        assertEquals(1, count)
+    }
 
     /** 七猫接口源解正文的原样写法：密文 = Base64(IV 16 字节 + AES/CBC 密文) */
     private val qimaoDecode = """
@@ -75,7 +212,7 @@ class JdkCompatTest {
     @Test
     fun `替身之外的 JDK 类一个都没有 —— Runtime、System、文件照样够不着`() {
         assertEquals("undefined", runtime.eval("typeof Packages.java.lang.Runtime", emptyMap()))
-        assertEquals("undefined", runtime.eval("typeof Packages.java.io", emptyMap()))
+        assertEquals("undefined", runtime.eval("typeof Packages.java.io.File", emptyMap()))
         assertEquals(
             "undefined",
             runtime.eval("var i = new JavaImporter(Packages.java.lang); with (i) { typeof System }", emptyMap()),

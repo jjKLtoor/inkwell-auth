@@ -52,6 +52,7 @@ import com.radium.inkwell.reader.render.RenderablePage
 import androidx.compose.ui.graphics.ImageBitmap
 import com.radium.inkwell.core.model.ContentElement
 import com.radium.inkwell.ui.components.MessageBus
+import com.radium.inkwell.ui.search.SearchScheduling
 import kotlinx.coroutines.Dispatchers
 import com.radium.inkwell.core.model.ChapterContent
 import kotlinx.coroutines.delay
@@ -66,8 +67,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -86,9 +85,7 @@ import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import com.radium.inkwell.core.source.Purifier
 import com.radium.inkwell.core.source.PurifyTimeoutException
@@ -1739,6 +1736,8 @@ class ReaderViewModel(
         sourceSearchJob = viewModelScope.launch {
             try {
                 val checkAuthor = appPrefs.changeSourceCheckAuthor.first()
+                val settings = appPrefs.searchPriorities.first()
+                val prioritized = if (settings.enabled) settings.sourceIds else emptySet()
                 // 排序而不是照库里的原顺序：面板照样要搜完所有源（用户点换源就是想看全部候选），
                 // 但让「以前有这本书的」「校验通过的」「响应快的」先占住那 8 个并发名额，
                 // 能用的结果就会更早出现在面板上，不必等到最后。
@@ -1760,42 +1759,30 @@ class ReaderViewModel(
                     checkAuthor = checkAuthor,
                     currentLatestChapter = currentLatestChapter(b),
                 )
-                // 与搜索页同样限流：几百个书源同时发请求只会集体超时/被限流
-                val limiter = Semaphore(8)
-                all.map { rule ->
-                    async {
-                        limiter.withPermit {
-                            // 三种结局必须分开记：搜到了 / 搜索跑通但没这本书 / 压根没搜成。
-                            // 只有前两种是关于"这个源有没有这本书"的证据；超时和报错什么都没证明。
-                            // 从前 getOrDefault(emptyList()) 把「报错」和「真的没有」压成同一个空结果 ——
-                            // 照那样记忆的话，一次网络抖动就能把一个好源永久打入冷宫。
-                            val outcome = withTimeoutOrNull(SOURCE_SEARCH_TIMEOUT_MS) {
-                                runCatching { engine.search(rule, b.title).items }.fold(
-                                    onSuccess = { items ->
-                                        val m = items.firstOrNull { titleMatches(it.title, b.title) }
-                                        if (m != null) SearchOutcome.Hit(m) else SearchOutcome.Miss
-                                    },
-                                    onFailure = { SearchOutcome.Failed },
-                                )
-                            } ?: SearchOutcome.Failed
-                            // 本轮搜索已被取代（重新点了换源）或被换源/关面板取消时，别再写状态：
-                            // 协程取消只在挂起点抛出，越过 withTimeoutOrNull 的僵尸任务会把脏结果写进
-                            // 新一轮刚清空的 rawCandidates、乱跳计数，还一起往 Main 刷 state 造成卡死。
-                            // 也挡住了 runCatching 吞掉的 CancellationException。
-                            coroutineContext.ensureActive()
-                            when (outcome) {
-                                is SearchOutcome.Hit -> {
-                                    synchronized(rawCandidates) { rawCandidates += outcome.result }
-                                    recordHit(rule.id, true, outcome.result.bookUrl)
-                                }
-                                SearchOutcome.Miss -> recordHit(rule.id, false, null)
-                                SearchOutcome.Failed -> Unit // 什么都没证明，不写库
-                            }
-                            done.incrementAndGet()
-                            scheduleCandidatePublish(done)
+                SearchScheduling.runPhases(all, { it.id in prioritized }) { rule ->
+                    // 结果或正常空页可更新来源命中记忆，网络错误与超时不构成证据。
+                    val outcome = withTimeoutOrNull(SOURCE_SEARCH_TIMEOUT_MS) {
+                        runCatching { engine.search(rule, b.title).items }.fold(
+                            onSuccess = { items ->
+                                val hit = items.firstOrNull { titleMatches(it.title, b.title) }
+                                if (hit != null) SearchOutcome.Hit(hit) else SearchOutcome.Miss
+                            },
+                            onFailure = { SearchOutcome.Failed },
+                        )
+                    } ?: SearchOutcome.Failed
+                    // 关闭换源面板或开始下一轮后，旧协程不能再写进候选列表。
+                    currentCoroutineContext().ensureActive()
+                    when (outcome) {
+                        is SearchOutcome.Hit -> {
+                            synchronized(rawCandidates) { rawCandidates += outcome.result }
+                            recordHit(rule.id, true, outcome.result.bookUrl)
                         }
+                        SearchOutcome.Miss -> recordHit(rule.id, false, null)
+                        SearchOutcome.Failed -> Unit
                     }
-                }.awaitAll()
+                    done.incrementAndGet()
+                    scheduleCandidatePublish(done)
+                }
                 candidatePublishJob?.cancel()
                 sourceSearchComplete = true
                 _state.value = _state.value.copy(

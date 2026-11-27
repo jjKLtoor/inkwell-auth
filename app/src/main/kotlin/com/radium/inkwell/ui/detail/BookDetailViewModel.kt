@@ -7,6 +7,7 @@ import com.radium.inkwell.data.db.dao.ChapterDao
 import com.radium.inkwell.data.db.entity.BookEntity
 import com.radium.inkwell.data.db.entity.BookType
 import com.radium.inkwell.data.db.entity.ChapterEntity
+import com.radium.inkwell.data.prefs.AppPrefs
 import com.radium.inkwell.data.repo.BookRepository
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.data.repo.NetBookRepository
@@ -30,6 +31,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class BookDetailUiState(
     val book: BookEntity? = null,
@@ -60,6 +62,7 @@ class BookDetailViewModel(
     private val sourceRepo: BookSourceRepository,
     private val chapterDao: ChapterDao,
     private val downloader: OfflineDownloader,
+    private val appPrefs: AppPrefs,
 ) : ViewModel() {
 
     private val refreshing = MutableStateFlow(false)
@@ -95,6 +98,17 @@ class BookDetailViewModel(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), BookDetailUiState())
 
     val messages = MessageBus()
+    val searchPriority = appPrefs.searchPriorities.map { bookId in it.bookIds }
+
+    fun setSearchPriority(on: Boolean) {
+        viewModelScope.launch {
+            try {
+                withContext(NonCancellable) { appPrefs.setBookSearchPriority(bookId, on) }
+            } catch (_: java.io.IOException) {
+                messages.emit("保存搜索优先级失败，请重试")
+            }
+        }
+    }
 
     /** 当前缓存任务或上次留下的可续跑范围。 */
     val download: StateFlow<OfflineDownload?> = downloader.downloads

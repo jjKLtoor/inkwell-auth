@@ -1,12 +1,20 @@
 package com.radium.inkwell.ui.search
 
+import com.radium.inkwell.data.db.entity.BookEntity
+import com.radium.inkwell.data.db.entity.BookType
 import com.radium.inkwell.data.db.entity.CheckStatus
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
 import com.radium.inkwell.data.repo.TitleMatch
 import kotlin.math.abs
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 /** 单个书源这一次搜索的结局；取消不算结局（不计入测速），由调用方原样往外抛 */
 internal sealed interface SearchOutcome {
@@ -31,6 +39,30 @@ internal sealed interface SearchOutcome {
  * 那是四个请求的总和，偏大，拿来定超时只会更宽松，不会误杀。
  */
 internal object SearchScheduling {
+
+    fun prioritizedIds(settings: SearchPriorityPreferences, keyword: String, books: List<BookEntity>): Set<String> {
+        if (!settings.enabled) return emptySet()
+        val title = normalizeSearchMatch(keyword)
+        return settings.sourceIds + books.asSequence()
+            // 搜索页未解锁隐藏区，不应通过优先顺序暴露其中的书。
+            .filter { it.id in settings.bookIds && it.type == BookType.NET && it.inShelf && !it.deleted && !it.hidden && !it.removedFromShelf }
+            .filter { normalizeSearchMatch(it.title) == title }
+            .mapNotNull { it.sourceId }
+            .toSet()
+    }
+
+    fun <T> phases(items: List<T>, prioritized: (T) -> Boolean): List<List<T>> {
+        val (first, rest) = items.partition(prioritized)
+        return listOf(first, rest).filter { it.isNotEmpty() }
+    }
+
+    /** 两阶段共用原并发上限。优先请求全部结束后，普通队列才获得调用机会。 */
+    suspend fun <T> runPhases(items: List<T>, prioritized: (T) -> Boolean, search: suspend (T) -> Unit) = coroutineScope {
+        val limiter = Semaphore(CONCURRENCY)
+        for (phase in phases(items, prioritized)) {
+            phase.map { item -> async { limiter.withPermit { search(item) } } }.awaitAll()
+        }
+    }
 
     /** 连续失败这么多次就排到最后。不剔除：站点抽风过后会恢复，搜成功一次就清零回到正常位置 */
     const val DEMOTE_AFTER_FAILS = 2

@@ -1,6 +1,8 @@
 package com.radium.inkwell.ui.sourcemanage
 
 import android.content.Context
+import com.radium.inkwell.data.prefs.AppPrefs
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -68,6 +70,7 @@ enum class SourceFilter(val label: String) {
     FAILED("失效"),
     UNCHECKED("未校验"),
     EXPLORE_ONLY("仅发现页"),
+    PRIORITIZED("优先搜索"),
 }
 
 enum class SourceSort(val label: String) {
@@ -100,7 +103,10 @@ class SourceManageViewModel(
     private val checker: SourceChecker,
     /** 「从网址导入书源」用；走注入的那个客户端，它配了超时（裸 OkHttpClient() 没有总闸） */
     private val http: OkHttpClient,
+    appPrefs: AppPrefs,
 ) : ViewModel() {
+
+    private val searchPriorities = appPrefs.searchPriorities
 
     // ---- 多选 ----
 
@@ -333,7 +339,7 @@ class SourceManageViewModel(
         kotlinx.coroutines.flow.combine(
             sources,
             _query.debounce { if (it.isEmpty()) 0L else QUERY_DEBOUNCE_MS },
-            _filter, _sort, _group, searchless,
+            _filter, _sort, _group, searchless, searchPriorities,
         ) { args ->
             @Suppress("UNCHECKED_CAST")
             val list = args[0] as List<BookSourceListItem>
@@ -342,9 +348,10 @@ class SourceManageViewModel(
             val o = args[3] as SourceSort
             val g = args[4] as String?
             val exploreOnly = (args[5] as BookSourceRepository.SearchlessIds).exploreOnly
+            val priorities = (args[6] as SearchPriorityPreferences).sourceIds
             list.asSequence()
                 .filter { matchesQuery(it, q) }
-                .filter { matchesFilter(it, f, exploreOnly) }
+                .filter { matchesFilter(it, f, exploreOnly, priorities) }
                 .filter { g == null || g in splitGroups(it.groupName) }
                 .sortedWith(sourceComparator(o))
                 .toList()
@@ -369,13 +376,14 @@ class SourceManageViewModel(
         return s.name.contains(k, true) || s.id.contains(k, true) || s.groupName.contains(k, true)
     }
 
-    private fun matchesFilter(s: BookSourceListItem, f: SourceFilter, exploreOnly: Set<String>): Boolean = when (f) {
+    private fun matchesFilter(s: BookSourceListItem, f: SourceFilter, exploreOnly: Set<String>, priorities: Set<String>): Boolean = when (f) {
         SourceFilter.ALL -> true
         SourceFilter.ENABLED -> s.enabled
         SourceFilter.DISABLED -> !s.enabled
         SourceFilter.FAILED -> s.checkStatus == CheckStatus.FAILED
         SourceFilter.UNCHECKED -> s.checkStatus == CheckStatus.UNCHECKED
         SourceFilter.EXPLORE_ONLY -> s.id in exploreOnly
+        SourceFilter.PRIORITIZED -> s.id in priorities
     }
 
     val failedCount: StateFlow<Int> = sources

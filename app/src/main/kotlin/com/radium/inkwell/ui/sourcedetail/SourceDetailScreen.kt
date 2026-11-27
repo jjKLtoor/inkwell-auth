@@ -30,6 +30,7 @@ import com.radium.inkwell.ui.components.CollectMessages
 import com.radium.inkwell.ui.components.CompactTextField
 import com.radium.inkwell.ui.components.SettingGroup
 import com.radium.inkwell.ui.components.SettingBlock
+import com.radium.inkwell.ui.components.SwitchRow
 import com.radium.inkwell.ui.components.SectionHeader
 import com.radium.inkwell.ui.components.Dimens
 import com.radium.inkwell.ui.components.SecondaryButton
@@ -52,6 +53,7 @@ fun SourceDetailScreen(
     viewModel: SourceDetailViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val searchPriority by viewModel.searchPriority.collectAsStateWithLifecycle(initialValue = false)
     val snackbar = remember { SnackbarHostState() }
 
     CollectMessages(viewModel.messages, snackbar)
@@ -129,6 +131,9 @@ fun SourceDetailScreen(
                         }
                     }
                 }
+            }
+            if (state.searchable) {
+                SwitchRow("优先搜索此来源", checked = searchPriority, onCheckedChange = viewModel::setSearchPriority)
             }
             // 控件装进卡里（设置类页面的骨架）：输入框的底是卡上的那一档，直接铺在灰底上几乎看不出框
             SectionHeader("全链路测试")

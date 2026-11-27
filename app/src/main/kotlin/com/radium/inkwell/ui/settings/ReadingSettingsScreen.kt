@@ -13,6 +13,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import com.radium.inkwell.data.prefs.AppPrefs
@@ -26,6 +27,7 @@ import com.radium.inkwell.ui.components.settingsPageColor
 import com.radium.inkwell.ui.components.rememberAppTopBarScroll
 import com.radium.inkwell.ui.components.topBarScroll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.map
 import org.koin.compose.koinInject
 import com.radium.inkwell.ui.components.AppScaffold
 
@@ -41,6 +43,8 @@ fun ReadingSettingsScreen(
     val checkAuthor = appPrefs.changeSourceCheckAuthorState.collectAsStateWithLifecycle().value ?: true
     val autoChangeSource = appPrefs.autoChangeSourceState.collectAsStateWithLifecycle().value ?: true
     val searchHistoryEnabled = appPrefs.searchHistoryEnabledState.collectAsStateWithLifecycle().value ?: true
+    val searchPrioritiesEnabled by remember(appPrefs) { appPrefs.searchPriorities.map { it.enabled } }
+        .collectAsStateWithLifecycle(initialValue = true)
 
     val pageColor = settingsPageColor()
     val topBarScroll = rememberAppTopBarScroll()
@@ -91,6 +95,12 @@ fun ReadingSettingsScreen(
             }
             SectionHeader("搜索")
             SettingGroup {
+                SwitchRow(
+                    title = "来源搜索优先级",
+                    checked = searchPrioritiesEnabled,
+                    onCheckedChange = { on -> scope.launch { appPrefs.setSearchPrioritiesEnabled(on) } },
+                    position = SettingGroupPosition.First,
+                )
                 // 关掉会顺带清空已有历史（见 AppPrefs.setSearchHistoryEnabled），副标题得把这个后果说在前面
                 SwitchRow(
                     title = "记录搜索历史",
@@ -98,7 +108,7 @@ fun ReadingSettingsScreen(
                     else "已关闭，搜过的词不会留在这台设备上",
                     checked = searchHistoryEnabled,
                     onCheckedChange = { on -> scope.launch { appPrefs.setSearchHistoryEnabled(on) } },
-                    position = SettingGroupPosition.Alone,
+                    position = SettingGroupPosition.Last,
                 )
             }
             Spacer(Modifier.height(Dimens.gapXL))

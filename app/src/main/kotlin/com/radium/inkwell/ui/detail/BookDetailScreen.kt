@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.layout.Box
 import androidx.compose.ui.unit.Dp
 import com.radium.inkwell.ui.components.AppDropdownMenu
+import com.radium.inkwell.ui.components.SwitchRow
 import com.radium.inkwell.ui.components.AppMenuItem
 import com.radium.inkwell.ui.components.AppScaffold
 import com.radium.inkwell.ui.components.horizontalOnly
@@ -86,6 +87,7 @@ fun BookDetailScreen(
     viewModel: BookDetailViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val searchPriority by viewModel.searchPriority.collectAsStateWithLifecycle(initialValue = false)
     val download by viewModel.download.collectAsStateWithLifecycle()
     val recovering by viewModel.recovering.collectAsStateWithLifecycle()
     val seriesVolumes by viewModel.seriesVolumes.collectAsStateWithLifecycle()
@@ -228,6 +230,13 @@ fun BookDetailScreen(
                         onResumeDownload = viewModel::resumeDownload,
                         onCancelDownload = viewModel::cancelDownload,
                     )
+                    if (b.type == BookType.NET && b.sourceId != null && b.inShelf && !b.hidden && !b.removedFromShelf) {
+                        SwitchRow(
+                            title = "搜索这本书时优先查当前来源",
+                            checked = searchPriority,
+                            onCheckedChange = viewModel::setSearchPriority,
+                        )
+                    }
                 }
                 item {
                     // 分组小标题，和设置页、书源页的一样（从前是 16sp 的一行字 + 分隔线）

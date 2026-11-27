@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.radium.inkwell.ui.bookshelf.BookshelfLayout
 import com.radium.inkwell.ui.bookshelf.ShelfColumns
@@ -40,6 +41,12 @@ import kotlinx.serialization.json.Json
 import java.io.IOException
 
 private const val FEEDBACK_RECEIPT_LIMIT = 30
+
+internal data class SearchPriorityPreferences(
+    val enabled: Boolean = true,
+    val sourceIds: Set<String> = emptySet(),
+    val bookIds: Set<String> = emptySet(),
+)
 
 private val Context.appDataStore by preferencesDataStore(
     name = "app_prefs",
@@ -80,6 +87,9 @@ class AppPrefs(private val context: Context) {
         val BOOKSHELF_COLUMNS = intPreferencesKey("bookshelf_columns")
         val HIDDEN_REQUIRE_AUTH = booleanPreferencesKey("hidden_require_auth")
         val SEARCH_HISTORY_ENABLED = booleanPreferencesKey("search_history_enabled")
+        val SEARCH_PRIORITIES_ENABLED = booleanPreferencesKey("search_priorities_enabled")
+        val PRIORITIZED_SOURCES = stringSetPreferencesKey("prioritized_sources")
+        val PRIORITIZED_BOOKS = stringSetPreferencesKey("prioritized_books")
         /** 搜索历史，新的在前，换行分隔（关键词入库前已把换行压成空格，见 [pushSearchHistory]） */
         val SEARCH_HISTORY = stringPreferencesKey("search_history")
         val FEEDBACK_RECEIPTS = stringPreferencesKey("feedback_receipts")
@@ -412,6 +422,34 @@ class AppPrefs(private val context: Context) {
      * 开关进备份、随设备同步；**历史本身不进备份**：搜过什么是这台设备上的事，
      * 同步过去等于把别人在另一台设备上搜的词摊在这台的搜索页上。
      */
+    /** 本机标签只存 ID，规则内容、书架行及备份格式不用改。 */
+    internal val searchPriorities: Flow<SearchPriorityPreferences> = context.appDataStore.data
+        .map { prefs ->
+            SearchPriorityPreferences(
+                enabled = prefs[Keys.SEARCH_PRIORITIES_ENABLED] ?: true,
+                sourceIds = prefs[Keys.PRIORITIZED_SOURCES].orEmpty(),
+                bookIds = prefs[Keys.PRIORITIZED_BOOKS].orEmpty(),
+            )
+        }
+        .catch { if (it is IOException) emit(SearchPriorityPreferences()) else throw it }
+        .distinctUntilChanged()
+
+    suspend fun setSearchPrioritiesEnabled(enabled: Boolean) {
+        context.appDataStore.edit { it[Keys.SEARCH_PRIORITIES_ENABLED] = enabled }
+    }
+
+    suspend fun setSourceSearchPriority(id: String, on: Boolean) = setSearchPriority(Keys.PRIORITIZED_SOURCES, id, on)
+
+    suspend fun setBookSearchPriority(id: String, on: Boolean) = setSearchPriority(Keys.PRIORITIZED_BOOKS, id, on)
+
+    private suspend fun setSearchPriority(key: Preferences.Key<Set<String>>, id: String, on: Boolean) {
+        context.appDataStore.edit { prefs ->
+            val ids = prefs[key].orEmpty()
+            val updated = if (on) ids + id else ids - id
+            if (updated.isEmpty()) prefs.remove(key) else prefs[key] = updated
+        }
+    }
+
     val searchHistoryEnabled: Flow<Boolean> = context.appDataStore.data.map { p ->
         p[Keys.SEARCH_HISTORY_ENABLED] ?: true
     }.distinctUntilChanged()

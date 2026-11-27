@@ -100,6 +100,8 @@ class EngineJsHttp(
         /** 此刻这根线程上跑的那次引擎调用的 Job；脚本运行时靠它响应取消（RhinoScriptRuntime） */
         internal fun currentJob(): Job? = parentJob.get()
 
+        internal fun currentInvocation(): Any? = currentSource.get()
+
         /** `java.ajaxAll` 同时在飞的请求数 */
         private const val AJAX_ALL_PARALLEL = 6
         private val AUTH_HEADER_NAMES = setOf("Authorization", "Proxy-Authorization", "Cookie")
@@ -115,6 +117,18 @@ class EngineJsHttp(
         val scope = currentSource.get()
         blockingUnderParent { request(url, method, body, headers, followRedirects, scope) }
     }.getOrNull()
+
+    internal fun fetchBinary(
+        url: String, method: String, body: ByteArray?, headers: Map<String, String>, timeoutMs: Long,
+    ): StrResponse? {
+        val scope = currentSource.get() ?: return null
+        return blockingUnderParent {
+            withTimeout(timeoutMs) {
+                // ISO-8859-1 将每个字节一对一映射，复用已有的正文编码与来源会话链路。
+                request(url, method, body?.toString(Charsets.ISO_8859_1), headers, false, scope, "ISO-8859-1")
+            }
+        }
+    }
 
     /**
      * `java.ajaxAll`：一起发、同一道看门（外层一取消，整批一起掐掉）。同时在飞的封顶 [AJAX_ALL_PARALLEL] 个：
@@ -148,6 +162,7 @@ class EngineJsHttp(
         headers: Map<String, String>,
         followRedirects: Boolean,
         scope: SourceScope?,
+        binaryCharset: String? = null,
     ): StrResponse {
         val loginNames = if (headers.isEmpty() || scope == null) emptySet()
         else scope.loginHeaderNames() + scope.observedLoginHeaderNames
@@ -171,10 +186,12 @@ class EngineJsHttp(
         // 4xx/5xx 也要交给脚本看 statusCode，不能在这儿抛成 ajax 空串
         val page = http.fetch(
             url, method = method, body = body, headers = sent,
+            charsetOverride = binaryCharset,
             throwOnHttpError = false,
             followRedirects = followRedirects,
             sourceId = scope?.id,
             credentialHeaders = credentialHeaders,
+            binaryScriptRequest = binaryCharset != null,
         )
         return StrResponse(
             bodyText = page.bodyText,

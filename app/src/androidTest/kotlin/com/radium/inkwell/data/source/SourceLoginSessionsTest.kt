@@ -83,19 +83,41 @@ class SourceLoginSessionsTest {
             }
             assertEquals("\"session=fixture\"", withTimeout(5_000) { clicked.await() })
 
-            val http = SourceHttpClient(sessionStore = sessions, webCookies = sessions::webCookies)
+            val http = SourceHttpClient(sessionStore = sessions, webCookies = sessions::webCookies,
+                updateWebCookies = sessions::updateWebCookies, clearWebCookies = sessions::clearWebCookies)
             assertEquals("", http.cookieOf(url.toString(), first))
             assertTrue(sessions.rememberWebLogin(first, url, url, "fixture UA"))
             assertFalse(sessions.rememberWebLogin(second, url, url, "fixture UA"))
             assertEquals("session=fixture", http.cookieOf(url.toString(), first))
             assertEquals("", http.cookieOf(url.toString(), second))
+            http.removeCookie(url.toString(), first)
+            assertEquals("", http.cookieOf(url.toString(), first))
+            assertFalse(SourceLoginSessions(context).hasWebLogin(first, url))
+
+            // 重新保存后只能读到新值，另一来源继续维持原状态。
+            val newCookie = CompletableDeferred<String?>()
+            withContext(Dispatchers.Main) {
+                webView.evaluateJavascript("document.cookie='session=renewed; Path=/; Secure'; document.cookie") {
+                    newCookie.complete(it)
+                }
+            }
+            assertEquals("\"session=renewed\"", withTimeout(5_000) { newCookie.await() })
+            assertTrue(sessions.rememberWebLogin(first, url, url, "fixture UA"))
+            assertEquals("session=renewed", http.cookieOf(url.toString(), first))
+            assertEquals("", http.cookieOf(url.toString(), second))
         } finally {
-            sessions.writeAll(first, mapOf(SourceSessionKey.WEB_ORIGINS to null, SourceSessionKey.WEB_USER_AGENTS to null))
+            sessions.clearWebCookies(first, url)
             withContext(Dispatchers.Main) {
                 webView.destroy()
                 val profiles = ProfileStore.getInstance()
-                profiles.deleteProfile(firstProfile)
-                profiles.deleteProfile(secondProfile)
+                for (name in listOf(firstProfile, secondProfile)) {
+                    try {
+                        profiles.deleteProfile(name)
+                    } catch (error: IllegalStateException) {
+                        // Chromium 可能保留已加载 profile 到进程退出。合成会话已上面清空，保留调用断言结果。
+                        if (!error.message.orEmpty().contains("in-use profile")) throw error
+                    }
+                }
             }
         }
     }

@@ -29,6 +29,9 @@
             com.radium.inkwell.core.source.js.JsConnection,
             com.radium.inkwell.core.source.js.SymmetricCrypto,
             com.radium.inkwell.core.source.js.JdkCompat,
+            com.radium.inkwell.core.source.js.GuardedUrl,
+            com.radium.inkwell.core.source.js.GuardedUrlConnection,
+            com.radium.inkwell.core.source.js.MemoryLineReader,
             com.radium.inkwell.core.source.js.*Shim {
     public <fields>;
     public <methods>;

@@ -564,6 +564,11 @@ class JavaBridge(
 
     // ---- 网络 ----
 
+    /** 由 JDK 兼容层调用，二进制请求仍使用当前来源引擎。 */
+    fun guardedUrl(url: String): GuardedUrl = GuardedUrl(
+        checkNotNull(http as? EngineJsHttp) { "当前脚本没有来源网络上下文" }, url,
+    )
+
     /**
      * 与 Legado 一致：地址可自带 `,{'method':'POST','body':…,'headers':…}` 选项，
      * 且**失败时返回错误文本而不是 null** —— 书源脚本普遍直接写 `java.ajax(url).match(…)`，

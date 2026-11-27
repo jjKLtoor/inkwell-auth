@@ -1,9 +1,23 @@
 package com.radium.inkwell.ui.search
 
 import com.radium.inkwell.core.source.BookSourceRule
+import com.radium.inkwell.core.source.BookSourceEngine
 import com.radium.inkwell.core.source.SearchRuleSet
+import com.radium.inkwell.core.source.SourceHttpClient
+import com.radium.inkwell.data.db.entity.BookEntity
+import com.radium.inkwell.data.db.entity.BookType
 import com.radium.inkwell.data.db.entity.CheckStatus
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -14,6 +28,53 @@ import kotlin.test.assertTrue
  * 3 秒出来还是 3 分钟出来 —— 坏源排在前面、统一等满 30 秒，就是从前「书源一多搜索就慢」的主要原因。
  */
 class SearchSchedulingTest {
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun 优先来源结束后才启动普通队列且各自只执行一次() = runTest {
+        val started = mutableListOf<String>()
+        val finished = CompletableDeferred<Unit>()
+        val queue = listOf("regular-a", "marked", "regular-b")
+        val search = launch {
+            SearchScheduling.runPhases(queue, { it == "marked" }) {
+                started += it
+                if (it == "marked") finished.await()
+            }
+        }
+        runCurrent()
+        assertEquals(listOf("marked"), started)
+        finished.complete(Unit)
+        search.join()
+        assertEquals(listOf("marked", "regular-a", "regular-b"), started)
+        assertEquals(listOf(queue), SearchScheduling.phases(queue) { false })
+    }
+
+    @Test fun 实际搜索中优先失败后仍向普通来源发出请求() = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(404))
+            server.enqueue(MockResponse().setBody("<div class='item'><span>测试书</span><a href='/book'>书</a></div>"))
+            val engine = BookSourceEngine(SourceHttpClient(allowPrivateNetwork = true))
+            val books = mutableListOf<String>()
+            SearchScheduling.runPhases(listOf("regular", "marked"), { it == "marked" }) { id ->
+                val rule = BookSourceRule(server.url("/").toString(), searchUrl = "/$id?q={{key}}",
+                    ruleSearch = SearchRuleSet(bookList = "div.item", name = "span@text", bookUrl = "a@href"))
+                val result = runCatching { engine.search(rule, "测试书") }
+                if (id == "marked") assertTrue(result.isFailure)
+                else books += result.getOrThrow().items.map { it.title }
+            }
+            assertEquals(listOf("/marked", "/regular"), List(2) { server.takeRequest(3, TimeUnit.SECONDS)?.requestUrl?.encodedPath })
+            assertEquals(listOf("测试书"), books)
+        }
+    }
+
+    @Test fun 单书标签仅在搜该书时优先当前绑定来源() {
+        val target = BookEntity(id = "saved", type = BookType.NET, title = "测试书", sourceId = "current", addedAt = 0, updatedAt = 0)
+        val settings = SearchPriorityPreferences(sourceIds = setOf("always"), bookIds = setOf(target.id))
+        assertEquals(setOf("always", "current"), SearchScheduling.prioritizedIds(settings, "《测试书》", listOf(target)))
+        assertEquals(setOf("always", "new"), SearchScheduling.prioritizedIds(settings, "测试书", listOf(target.copy(sourceId = "new"))))
+        assertEquals(setOf("always"), SearchScheduling.prioritizedIds(settings, "另一部", listOf(target)))
+        assertEquals(setOf("always"), SearchScheduling.prioritizedIds(settings, "测试书", listOf(target.copy(hidden = true))))
+        assertTrue(SearchScheduling.prioritizedIds(settings.copy(enabled = false), "测试书", listOf(target)).isEmpty())
+    }
 
     private fun src(
         id: String,

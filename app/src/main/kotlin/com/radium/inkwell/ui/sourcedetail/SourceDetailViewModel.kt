@@ -15,6 +15,7 @@ import com.radium.inkwell.core.source.js.StrResponse
 import com.radium.inkwell.core.source.webLoginUrl
 import com.radium.inkwell.core.source.webLoginUserAgent
 import com.radium.inkwell.data.repo.BookSourceRepository
+import com.radium.inkwell.data.prefs.AppPrefs
 import com.radium.inkwell.data.repo.NetBookRepository
 import com.radium.inkwell.data.source.SourceLoginSessions
 import com.radium.inkwell.data.source.loginProfileName
@@ -25,10 +26,12 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -70,10 +73,12 @@ class SourceDetailViewModel internal constructor(
     private val netBookRepo: NetBookRepository,
     private val engine: BookSourceEngine,
     private val sessions: SourceLoginSessions,
+    private val appPrefs: AppPrefs,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(SourceDetailUiState())
     val state: StateFlow<SourceDetailUiState> = _state.asStateFlow()
+    val searchPriority = appPrefs.searchPriorities.map { sourceId in it.sourceIds }
 
     /** 一次性提示：与其他管理页一样走共享 MessageBus + CollectMessages */
     val messages = MessageBus()
@@ -110,6 +115,17 @@ class SourceDetailViewModel internal constructor(
 
     fun setTestKeyword(text: String) {
         _state.value = _state.value.copy(testKeyword = text)
+    }
+
+    fun setSearchPriority(on: Boolean) {
+        viewModelScope.launch {
+            try {
+                // 点完即返回时，已经发起的本机设置写入仍须完成。
+                withContext(NonCancellable) { appPrefs.setSourceSearchPriority(sourceId, on) }
+            } catch (_: java.io.IOException) {
+                messages.emit("保存搜索优先级失败，请重试")
+            }
+        }
     }
 
     fun openLogin() = launchLogin { source ->

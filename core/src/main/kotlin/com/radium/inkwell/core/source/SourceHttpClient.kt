@@ -288,9 +288,12 @@ class SourceHttpClient(
         followRedirects: Boolean = true,
         sourceId: String? = null,
         credentialHeaders: Set<String> = emptySet(),
+        binaryScriptRequest: Boolean = false,
     ): FetchedPage {
         dataUriPage(url)?.let { return it }
         val httpUrl = url.toHttpUrlOrNull() ?: throw IOException("非法 URL: $url")
+        // 二进制脚本请求可能在路径或查询串带会话参数，诊断只记站点。
+        val logUrl = if (binaryScriptRequest) httpUrl.sourceOrigin().toString() else url
         if (rateLimit != null && rateLimit.intervalMs > 0) {
             buckets.computeIfAbsent(httpUrl.host) { TokenBucket(rateLimit) }.acquire()
         }
@@ -307,17 +310,18 @@ class SourceHttpClient(
                 // 连接池里的旧连接被服务端单方面关了、移动网络切基站。再试一次就好，用户却得
                 // 自己点重试。只重试 GET/HEAD —— POST 可能已经送达，重放会把提交做两遍。
                 // 一次为限：被防火墙或 WAF 稳定掐断的站，再试多少次都一样，只是让人多等。
-                if (!disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
+                if (!binaryScriptRequest && !disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
                     disconnectRetried = true
                     logger.log(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
                     delay(retryBaseDelayMs)
                     continue
                 }
-                logger.log(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
+                if (binaryScriptRequest) logger.log(true, "$method $logUrl 请求失败（${elapsedMs(startNs)}ms）", null)
+                else logger.log(true, "$method $logUrl 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
                 throw e
             }
             val hasRateLimitDelay = response.code == 429 && !response.header("Retry-After").isNullOrBlank()
-            if (response.code in RETRY_CODES && attempt < MAX_RETRIES && !hasRateLimitDelay) {
+            if (!binaryScriptRequest && response.code in RETRY_CODES && attempt < MAX_RETRIES && !hasRateLimitDelay) {
                 logger.log(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
                 response.close()
                 delay(retryBaseDelayMs shl attempt) // 指数退避：base、base*2
@@ -332,13 +336,14 @@ class SourceHttpClient(
                 val bytes = try {
                     withContext(Dispatchers.IO) { readBounded(resp, url) }
                 } catch (e: IOException) {
-                    logger.log(true, "$method $url → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
+                    if (binaryScriptRequest) logger.log(true, "$method $logUrl → HTTP ${resp.code}，读响应体失败", null)
+                    else logger.log(true, "$method $logUrl → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
                     throw e
                 }
                 val charset = detectCharset(charsetOverride, resp.header("Content-Type"), bytes)
                 logger.log(
                     false,
-                    "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms，${bytes.size} B，${charset.name()}）",
+                    "$method $logUrl → HTTP ${resp.code}（${elapsedMs(startNs)}ms，${bytes.size} B，${charset.name()}）",
                     null,
                 )
                 return FetchedPage(

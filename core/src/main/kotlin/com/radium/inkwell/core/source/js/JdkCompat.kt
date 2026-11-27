@@ -2,6 +2,7 @@ package com.radium.inkwell.core.source.js
 
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.UUID
 import java.util.zip.Inflater
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -56,6 +57,25 @@ class JdkCompat {
     fun urlEncode(text: String, charset: String): String = java.net.URLEncoder.encode(text, charset(charset))
 
     fun urlDecode(text: String, charset: String): String = java.net.URLDecoder.decode(text, charset(charset))
+
+    /** 只返回 UUID 文本，来源脚本不能拿到 JDK 对象。 */
+    fun randomUuid(): String = UUID.randomUUID().toString()
+
+    fun bigInteger(text: String, radix: Int): BigIntegerShim = BigIntegerShim.parse(text, radix)
+    fun bigIntegerBytes(bytes: ByteArray): BigIntegerShim = BigIntegerShim.fromBytes(bytes)
+    fun bigIntegerMagnitude(sign: Int, bytes: ByteArray): BigIntegerShim = BigIntegerShim.fromMagnitude(sign, bytes)
+    fun randomBigInteger(bits: Int, random: SecureRandomShim): BigIntegerShim = random.integer(bits)
+    fun secureRandom(): SecureRandomShim = SecureRandomShim()
+
+    fun charsetName(name: String): String = charset(name).name()
+
+    fun memoryOutput(size: Int): MemoryOutputShim = MemoryOutputShim(size)
+
+    fun gzipOutput(target: MemoryOutputShim): GzipOutputShim = GzipOutputShim(target)
+
+    fun gzipInput(input: MemoryInputShim): MemoryInputShim = input.gunzip()
+
+    fun memoryReader(input: MemoryInputShim, charset: String): MemoryLineReader = input.reader(charset)
 
     /**
      * `java.lang.Thread.sleep(毫秒)`：来源在两次请求之间随机停一会儿，免得被站点限流（八叉书库的目录）。
@@ -237,11 +257,38 @@ class JdkCompat {
   });
   var TxtNode = cls('TextNode', function (t) { return jdk.jsoupTextNode(str(t)); });
   var Elem = cls('Element', function (tag) { return jdk.jsoupElement(String(tag)); });
+  var Uuid = cls('UUID', null, { randomUUID: function () { return String(jdk.randomUuid()); } });
+  var Random = cls('SecureRandom', function () { return jdk.secureRandom(); });
+  var BigInt = cls('BigInteger', function (value, arg) {
+    if (typeof value === 'string') return jdk.bigInteger(value, arguments.length > 1 ? Number(arg) : 10);
+    if (arguments.length > 1) return arg != null && typeof arg.length === 'number'
+      ? jdk.bigIntegerMagnitude(Number(value), arg) : jdk.randomBigInteger(Number(value), arg);
+    return jdk.bigIntegerBytes(value);
+  }, { valueOf: function (value) {
+    if (!Number.isSafeInteger(value)) throw new RangeError('大整数超出 JavaScript 安全整数范围，请使用字符串构造');
+    return jdk.bigInteger(String(value), 10);
+  } });
+  Object.defineProperties(BigInt, {
+    ZERO: { get: function () { return jdk.bigInteger('0', 10); } },
+    ONE: { get: function () { return jdk.bigInteger('1', 10); } },
+    TEN: { get: function () { return jdk.bigInteger('10', 10); } }
+  });
+  var Charset = cls('Charset', null, { forName: function (name) { return String(jdk.charsetName(String(name))); } });
+  var MemOut = cls('ByteArrayOutputStream', function (size) { return jdk.memoryOutput(size == null ? 32 : Number(size)); });
+  var GzipOut = cls('GZIPOutputStream', function (out) { return jdk.gzipOutput(out); });
+  var GzipIn = cls('GZIPInputStream', function (input) { return jdk.gzipInput(input); });
+  var InputReader = cls('InputStreamReader', function (input, encoding) { return jdk.memoryReader(input, encoding == null ? 'UTF-8' : String(encoding)); });
+  var BufferedReader = cls('BufferedReader', function (reader) { return reader; });
+  var Url = cls('URL', function (address) { return top.java.guardedUrl(String(address)); });
+  var TextUtils = cls('TextUtils', null, { isEmpty: function (value) { return value == null || String(value).length === 0; } });
   var pkgs = {
-    java: { lang: { String: Str, Thread: Thr }, util: { Base64: B64, Arrays: Arr, ArrayList: AList, zip: { Inflater: Infl } }, security: { MessageDigest: Md },
-      net: { URLEncoder: UrlEnc, URLDecoder: UrlDec } },
+    java: { lang: { String: Str, Thread: Thr }, util: { Base64: B64, Arrays: Arr, ArrayList: AList, UUID: Uuid,
+      zip: { Inflater: Infl, GZIPOutputStream: GzipOut, GZIPInputStream: GzipIn } },
+      math: { BigInteger: BigInt }, security: { MessageDigest: Md, SecureRandom: Random }, net: { URLEncoder: UrlEnc, URLDecoder: UrlDec, URL: Url },
+      io: { ByteArrayOutputStream: MemOut, InputStreamReader: InputReader, BufferedReader: BufferedReader },
+      nio: { charset: { Charset: Charset } } },
     javax: { crypto: { Cipher: Ciph, spec: { SecretKeySpec: Key, IvParameterSpec: Iv, GCMParameterSpec: Gcm } } },
-    android: { util: { Base64: B64 } },
+    android: { util: { Base64: B64 }, text: { TextUtils: TextUtils } },
     org: { jsoup: { Jsoup: Jsp, Connection: Conn, nodes: { TextNode: TxtNode, Element: Elem }, parser: { Parser: Prs } } }
   };
   function importInto(target, what) {
