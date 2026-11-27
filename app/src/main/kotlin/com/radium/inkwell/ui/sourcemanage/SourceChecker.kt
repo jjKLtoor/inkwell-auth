@@ -1,7 +1,6 @@
 package com.radium.inkwell.ui.sourcemanage
 
-import com.radium.inkwell.data.source.probeSourceContent
-import com.radium.inkwell.data.source.SHORT_SOURCE_CONTENT_CHARS
+import com.radium.inkwell.core.model.ContentElement
 import com.radium.inkwell.core.source.BookSourceEngine
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.data.repo.NetBookRepository
@@ -152,9 +151,12 @@ class SourceChecker(
         // 走到哪一步了：失败原因前面写上它（「详情页被拒」「正文超时」）。超时是外层 withTimeout 掐断的，
         // 掐断时停在哪一步也只有靠它知道
         var step = CheckStep.SEARCH
+        // 来源自己指定了校验词就用它（同阅读的 getCheckKeyword：来源的优先于校验设置里的）：
+        // 只收某一类书、按分类名搜的站，拿通用的词去搜必然「搜索无结果」，好好的源被判失效
+        val keyword = rule.search?.checkKeyWord?.trim()?.takeIf { it.isNotEmpty() } ?: opts.keyword
         return runCatching {
             withTimeout(opts.timeoutMs) {
-                val hit = engine.search(rule, com.radium.inkwell.data.source.sourceTestKeyword(rule, opts.keyword)).items.firstOrNull()
+                val hit = engine.search(rule, keyword).items.firstOrNull()
                     ?: throw CheckFailed("搜索无结果")
                 if (!opts.checkDetail && !opts.checkToc && !opts.checkContent) {
                     return@withTimeout ok(chars = -1, startedAt)
@@ -170,14 +172,35 @@ class SourceChecker(
 
                 step = CheckStep.CONTENT
                 val urls = toc.mapTo(HashSet()) { it.url }
-                val probe = probeSourceContent(toc) { chapter ->
-                    engine.getContent(
-                        rule, chapter.url, urls, chapter.variable,
-                        chapterTitle = chapter.title, chapterIndex = chapter.index,
-                        bookUrl = hit.bookUrl, bookTitle = detail.title, variables = detail.variables,
-                    )
+                val probes = listOfNotNull(
+                    toc.first(),
+                    toc.getOrNull(toc.size / 2).takeIf { toc.size > 1 },
+                )
+                var best = 0
+                var lastError: Throwable? = null
+                for (chapter in probes) {
+                    val chars = runCatching {
+                        engine.getContent(
+                            rule, chapter.url, urls, chapter.variable,
+                            chapterTitle = chapter.title, chapterIndex = chapter.index,
+                            variables = detail.variables,
+                        )
+                            .elements
+                            .filterIsInstance<ContentElement.Paragraph>()
+                            .sumOf { it.text.length }
+                    }.getOrElse {
+                        // 取消（含外层 withTimeout 到点）必须放出去给外层那段判定：吞在这里的话，
+                        // 超时的源会被写成「正文为空」而不是超时，用户取消校验也会被记成失效。
+                        if (it is CancellationException) throw it
+                        lastError = it
+                        0
+                    }
+                    if (chars > best) best = chars
+                    if (best >= SHORT_CONTENT_CHARS) break
                 }
-                ok(probe.chars, startedAt)
+                // 两章都抓不到：有报错就拿报错归类（「正文被拒」「正文超时」），没报错才是真的空
+                if (best == 0) throw (lastError ?: CheckFailed("正文为空"))
+                ok(best, startedAt)
             }
         }.getOrElse {
             // 用户点「取消校验」时，在飞的这些源抛的是 CancellationException。把它当成判定结果
@@ -198,7 +221,7 @@ class SourceChecker(
      */
     private fun ok(chars: Int, startedAt: Long): SourceCheck {
         val ms = System.currentTimeMillis() - startedAt
-        return SourceCheck(true, CheckMessages.ok(ms, shortContent = chars in 1 until SHORT_SOURCE_CONTENT_CHARS), ms)
+        return SourceCheck(true, CheckMessages.ok(ms, shortContent = chars in 1 until SHORT_CONTENT_CHARS), ms)
     }
 
     /** 校验自己下的结论（搜索无结果、目录为空、正文为空）：原样当失败原因，不再归类、不加步骤 */
@@ -207,5 +230,7 @@ class SourceChecker(
     private companion object {
         /** 并发上限。几百个源同时打网站只会集体被限流，反而校验出一堆假的"失效" */
         const val CHECK_CONCURRENCY = 6
+        /** 低于此字数只提示"正文偏短"，不判失败 —— 序章、过渡章本来就短 */
+        const val SHORT_CONTENT_CHARS = 100
     }
 }

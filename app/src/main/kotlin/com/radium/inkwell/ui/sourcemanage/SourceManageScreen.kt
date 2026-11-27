@@ -50,6 +50,7 @@ import com.radium.inkwell.ui.components.AppSlider
 import com.radium.inkwell.ui.components.AppSnackbarHost
 import com.radium.inkwell.ui.components.AppTextButton
 import com.radium.inkwell.ui.components.AppToolbar
+import com.radium.inkwell.ui.components.SelectionToolbar
 import com.radium.inkwell.ui.components.BackButton
 import com.radium.inkwell.ui.components.BatchAction
 import com.radium.inkwell.ui.components.BatchActionBar
@@ -86,7 +87,6 @@ import top.yukonga.miuix.kmp.icon.extended.Delete
 import top.yukonga.miuix.kmp.icon.extended.Import
 import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.icon.extended.Search
-import top.yukonga.miuix.kmp.icon.extended.SelectAll
 import top.yukonga.miuix.kmp.icon.extended.Sort
 import top.yukonga.miuix.kmp.icon.extended.Tasks
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -169,23 +169,13 @@ fun SourceManageScreen(
         containerColor = pageColor,
         topBar = {
             if (selectionMode) {
-                // HyperOS 编辑模式：顶栏只留 × · 已选 N 个 · 全选，批量动作在底部的操作条里（见 floatingToolbar）
-                AppToolbar(
-                    navigationIcon = {
-                        AppIconButton(onClick = viewModel::clearSelection) {
-                            Icon(MiuixIcons.Close, contentDescription = "退出多选")
-                        }
-                    },
+                SelectionToolbar(
+                    title = "已选 ${selected.size} 个",
                     containerColor = pageColor,
-                    actions = {
-                        AppIconButton(onClick = viewModel::selectAll) {
-                            Icon(MiuixIcons.SelectAll, contentDescription = "全选")
-                        }
-                    },
+                    onExit = viewModel::clearSelection,
+                    onSelectAll = viewModel::selectAll,
                     bottomContent = listHeader,
-                ) {
-                    ToolbarTitle("已选 ${selected.size} 个")
-                }
+                )
             } else AppToolbar(
                 navigationIcon = { BackButton(onClick = onBack) },
                 containerColor = pageColor,
@@ -377,7 +367,7 @@ fun SourceManageScreen(
                 CompactTextField(
                     value = draft.keyword,
                     onValueChange = { draft = draft.copy(keyword = it) },
-                    placeholder = "留空使用来源校验词",
+                    placeholder = "搜索关键词",
                 )
                 Text(
                     "要一个几乎每个站都搜得出结果的常见词",
@@ -502,7 +492,7 @@ private fun SourceImportDialog(
     var selection by remember(preview) { mutableStateOf("original") }
     var newGroup by remember(preview) { mutableStateOf("") }
     val groupOptions = remember(groups) {
-        listOf(PickerOption("original", "沿用书源自带分组")) +
+        listOf(PickerOption("original", "沿用来源自带分组")) +
             groups.map { PickerOption("group:$it", it) } +
             listOf(PickerOption("none", "不分组"), PickerOption("new", "新建分组…"))
     }
@@ -510,9 +500,9 @@ private fun SourceImportDialog(
         preview.skipped.groupingBy { it.substringAfterLast(": ", it) }.eachCount()
     }
     AppAlertDialog(
-        title = "确认导入书源",
+        title = "确认导入来源",
         onDismissRequest = onDismiss,
-        confirmText = if (preview.count > 0) "导入 ${preview.count} 个书源" else "知道了",
+        confirmText = if (preview.count > 0) "导入 ${preview.count} 个来源" else "知道了",
         dismissText = "取消".takeIf { preview.count > 0 },
         confirmEnabled = selection != "new" || newGroup.isNotBlank(),
         confirmLoading = saving,
@@ -529,7 +519,7 @@ private fun SourceImportDialog(
             Text("新增 ${preview.added}　更新 ${preview.updated}　跳过 ${preview.skipped.size}")
             if (preview.added > 0) {
                 SpinnerSettingRow(
-                    title = "新增书源分组",
+                    title = "新增来源分组",
                     options = groupOptions,
                     selectedId = selection,
                     onSelect = { selection = it.id },
@@ -544,7 +534,7 @@ private fun SourceImportDialog(
                 }
             }
             if (preview.updated > 0) {
-                Text("同地址的书源会更新规则，沿用本机分组。", style = MiuixTheme.textStyles.footnote1)
+                Text("同地址的来源会更新规则，沿用本机分组。", style = MiuixTheme.textStyles.footnote1)
             }
             for ((reason, count) in reasons) {
                 Text("$count 条 · $reason", style = MiuixTheme.textStyles.footnote1)

@@ -68,11 +68,11 @@ App 的 UI 库是 **[Miuix](https://github.com/compose-miuix-ui/miuix)**（Hyper
 
 「跟随壁纸」是一个预设 id（`AppThemes.DYNAMIC`），日/夜两槽都能选；颜色由 Miuix `ThemeController`（Monet 模式、不给 keyColor）读系统调色板生成。解析统一走 `rememberResolvedScheme`（MainActivity 设窗体底色、`InkwellTheme` 铺整树共用这一个结果），别在别处直接调 `AppThemes.resolve` 而漏掉壁纸配色。
 
-代价记清楚：Miuix 是 **0.x 实验线**，作者明说 API 可能不打招呼就改。Compose 用**稳定 BOM**，和 Miuix 构建时对的那一版 Compose（0.9.4 → 1.12）保持一致（从前为 M3 Expressive 走 alpha BOM、跑在 1.13 beta 上，那是 Miuix 没测过的组合）。升 Miuix 或 BOM 前先读 release notes 的 breaking change 段，再对一下两边的 Compose 版本，别盲升。
+Miuix 是 **0.x 实验线**，升级前先读发行说明的破坏性变更，再核对 Compose 版本。当前 Miuix 0.9.5-beta04 基于 Compose 1.13 RC，Android 侧使用同一版本线的稳定 BOM。玻璃边缘高光由 `miuix-material` 的 `GlassEdgeStrokes` 与 `Modifier.edgeStroke` 提供。
 
 ### 圆角 → `AppShapes`（`ui/theme/AppTheme.kt`）
 
-Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)/`small`(8)/`medium`(12)/`large`(16，对齐 Miuix 卡片)/`extraLarge`(28，对齐 Miuix 底部面板)，用 Dp 半径（`AppShapes.radiusMedium`）。
+Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)/`small`(8)/`medium`(12)/`large`(16，对齐 Miuix 卡片)/`extraLarge`(28)，用 Dp 半径（`AppShapes.radiusMedium`）。对话框、底部面板和下拉菜单的外轮廓统一用 `AppShapes.radiusPopup`（24dp），参考 Miuix 的 OS 4 玻璃菜单。
 
 **12dp 及以上的「面」一律 squircle**（HyperOS 的连续曲率圆角，`miuix-squircle`；Miuix 的卡片、按钮、面板、页签全是它）：卡片用 Miuix `Card`，其余的面用 `AppSurface`，修饰符级别用 `Modifier.squircleSurface` / `squircleClip`，描边 `squircleBorder`，分组卡里按角切的行用 `SquircleCorners`（后三样都在 `ui/components/AppSurface.kt`）。毛玻璃要圆角时，外面套 `squircleClip`、玻璃本身给 `RectangleShape`（见 `SelectionToolbar`）；玻璃带边缘高光的，shape 给同一条曲线的 `squircleShape(radius)`（同文件），否则高光是直角、四个角被裁掉；**别自己另写 Shape 给高光** —— miuix-blur 的高光只从 `CornerBasedShape` 读圆角半径，认不出的一律按短边一半画，卡片中间会多出一个胶囊形的椭圆（`squircleShape` 因此继承了它）。**别**再 `clip(AppShapes.large)` / Miuix `Surface(shape = …)` —— 那是普通圆弧，夹在 Miuix 组件中间弯法差一截，被指出过「圆角不统一」。Shape（`AppShapes.small` 等）只留给 4~8dp 的标签、封面、热力图格子：连续曲率在小半径上看不出来，而 squircle 每个都开一个离屏层，书架一屏几十本封面不值。挨在一起的控件同一档：分段槽、页签槽、卡里的按钮都是 48dp 高 + `radiusMedium`，槽里的浮块 `radiusSmall`。**不要**裸写 `RoundedCornerShape(12.dp)`。
 
@@ -114,7 +114,7 @@ Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)
 | 带 label 的整页表单输入 | `AppFormField`（同文件，Miuix `TextField` 的浮动 label；报错时描边换 error 色、`supportingText` 在框外）。意见反馈这类无 label 的整页输入走 `CompactTextArea` / `CompactTextField` |
 | 滑块 | `AppSlider`（`AppSlider.kt`，Miuix `Slider` 胶囊粗轨）：给 `label`（读屏名字）；夹在两行字之间的传 `height = Dimens.sliderCompact`。`activeColor` 只给阅读器浮层（纸色背景）用 |
 | 调色滑块（拖到哪儿就是那个颜色） | `AppColorSlider`（`AppColorSlider.kt`）：渐变轨 + 白圈里填当前色的拇指，渐变两端画在拇指走得到的两头，拇指底下就是它代表的颜色；给 `label`。只给「挑颜色」用（阅读器的自定义纸张：一行一条，行头两个字的名字）。亮度、字号这种有多少之分的量仍用 `AppSlider` —— 别再把几条颜色参数做成填强调色的 `AppSlider` 叠在一起（被指出过：三条连成一块、分不清谁是谁） |
-| 单选横滚 chip 条 | `ChipRow`（内部固定横滚，`contentPadding` 给首尾边距；额外动作 chip 走 `trailing`，别再手搓 `Row` + chip）；单个独立 chip 用 `AppFilterChip`。条末尾的「添加」（导入字体）用 `AddChip`（空心实线圆 + ＋）——**动作别长成选项的样子**，从前「导入字体」是一颗普通 chip，看着像一款叫「导入字体」的字；条里的项要长按删除传 `longClickActions`。Miuix 没有 chip，这两个是自画的 HyperOS 胶囊（选中 `tertiaryContainer`）。选中项跟着滚动变、不是手点出来的（协议页的节 chip）传 `bringSelectedIntoView = true`，亮到条外面会自己横滚过来。和 `SegmentedChoice` 同处一张面板时（阅读设置）传 `solidSelection = true`，选中态与分段一样实心填强调色，别让一张面板里出现两种「选中」 |
+| 单选横滚 chip 条 | `ChipRow`（内部固定横滚，`contentPadding` 给首尾边距；额外动作 chip 走 `trailing`，别再手搓 `Row` + chip）；单个独立 chip 用 `AppFilterChip`。条里的项要长按删除传 `longClickActions`。Miuix 没有 chip，这两个是自画的 HyperOS 胶囊（选中 `tertiaryContainer`）。选中项跟着滚动变、不是手点出来的（协议页的节 chip）传 `bringSelectedIntoView = true`，亮到条外面会自己横滚过来。和 `SegmentedChoice` 同处一张面板时（阅读设置）传 `solidSelection = true`，选中态与分段一样实心填强调色，别让一张面板里出现两种「选中」 |
 | 几档里选一档（固定 2~5 档） | `SegmentedChoice`（`SegmentedChoice.kt`）：灰槽里浮起一块，选中段实心填强调色（不是白块 —— 白块在白卡上分不清）。选项多或会变的（字体、方案、七档间隔）仍用 `ChipRow` |
 | 从一排色块 / 图标里挑一个（主题色板、应用图标的图形与纸色） | `SwatchChoice`（`SwatchChoice.kt`）：52dp 的块 + 下面一行名字，选中描主色圈 + 右下角一枚勾 + 名字换主色加粗，没选中的描细分隔线（浅色块放白卡上才看得出边）；`cornerRadius` 给了是 squircle（图标预览），不给是圆形色板。整块一个单选目标、带名字（名字的 Text 在可点区外）。描边叠在内容**上面**一层画 —— Miuix 的 `squircleBorder` 画在内容底下（onDrawBehind），块里铺一张不透明的图就被整个盖住 |
 | 列表行密度 | 默认 `DefaultPadding`（= Miuix `BasicComponent`）；带封面/大图标/行尾 48dp 图标按钮的行（`BookListRow`、书架列表、`AppIconSheet`、搜索历史）用 `MediaPadding`。从前默认是上下 4dp，两三行字的行（书源、净化规则、订阅文章）挤成一片，被指出不合规范 |
@@ -201,7 +201,6 @@ Miuix 没有主题级 Shapes，组件按 Dp 收圆角。刻度：`extraSmall`(4)
 ## 发布流程
 
 - 版本号**唯一来源**：`gradle/libs.versions.toml` 的 `inkwell = "x.y.z"`。CI 校验 tag 必须等于 `v$版本`。
-- 本 fork 合入 `origin/main` 时，以被合入提交的 `inkwell` 配置为版本基线。合并前读取远端跟踪分支的值，合并后核对开发分支的值，打包后核对 APK 版本名和版本码。认证功能迭代通过文件名、提交号和说明区分构建。
 - 发布 = 打**附注 tag** `vx.y.z` 并推送 → 触发 `.github/workflows/release.yml`。
 - **tag 注解正文 = GitHub Release 正文 = 应用内更新弹窗内容 = 关于页点「版本」看到的内容**。CI 会自动剔掉 `Co-Authored-By`/`Signed-off-by` trailer 和 `Full Changelog`。
 - 关于页那份是打包前写进安装包的（release.yml 的「Extract tag message」把正文与 tag 日期写进 `app/src/main/assets/release/`，该目录不入库；读取见 `BundledReleaseNotes`）：所以那一步**必须在 `assembleRelease` 之前**。本地编的包没有它，弹窗里写「这个安装包没有附带更新说明」。

@@ -1,6 +1,9 @@
 package com.radium.inkwell.core.source.js
 
 import com.radium.inkwell.core.source.SourceHttpClient
+import com.radium.inkwell.core.source.parseHeaderJson
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -46,7 +49,45 @@ class EngineJsHttp(
      * 瞬间回空串，书源就「时好时坏」，还复现不出来。
      * [asContextElement] 在每次恢复时重设、挂起时还原，线程怎么跳都拿到自己的 Job。
      */
-    fun bindingTo(job: Job?): CoroutineContext = parentJob.asContextElement(job)
+    fun bindingTo(job: Job?, sourceId: String? = null): CoroutineContext =
+        parentJob.asContextElement(job) + currentSource.asContextElement(SourceScope(sourceId))
+
+    internal fun bindingTo(
+        job: Job?,
+        sourceId: String?,
+        loginHeaderNames: () -> Set<String>,
+        allowsLoginOrigin: (String) -> Boolean,
+        userAgent: () -> String? = { null },
+    ): CoroutineContext = parentJob.asContextElement(job) +
+        currentSource.asContextElement(SourceScope(sourceId, loginHeaderNames, allowsLoginOrigin, userAgent))
+
+    private data class SourceScope(
+        val id: String?,
+        val loginHeaderNames: () -> Set<String> = { emptySet() },
+        val allowsLoginOrigin: (String) -> Boolean = { true },
+        /**
+         * 脚本请求没写 User-Agent 时发的：和这个来源的页面请求同一个 UA（见 BookSourceEngine.engineIo）。
+         * 同阅读：`java.ajax` 带着来源的请求头发，`java.get` / `post` 走 Jsoup、默认也是桌面 UA。
+         * 从前一律落到 SourceHttpClient 的手机 UA，同一个来源，页面是一套、脚本请求是另一套。交回 null = 不管（订阅源）。
+         * 是个函数：要跑请求头脚本才算得出来，没有脚本请求的调用就不算
+         */
+        val userAgent: () -> String? = { null },
+    ) {
+        val observedLoginHeaderNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        /** 这一次引擎调用里脚本发出去的请求数，见 [requestCount] */
+        val requests = AtomicInteger()
+    }
+
+    /**
+     * 这一次引擎调用里，脚本到目前为止发出去的请求数（java.ajax、Jsoup 替身、ajaxAll 都算）。
+     * 正文抓页失败后放脚本兜底时，引擎拿它判断脚本是不是真自己取了正文（见 BookSourceEngine.collectContent）
+     */
+    internal fun requestCount(): Int = currentSource.get()?.requests?.get() ?: 0
+
+    // 交互登录脚本可能在会话正式保存前就用新请求头做校验。
+    internal fun rememberLoginHeaders(header: String) {
+        currentSource.get()?.observedLoginHeaderNames?.addAll(parseHeaderJson(header).keys)
+    }
 
     companion object {
         /**
@@ -54,12 +95,16 @@ class EngineJsHttp(
          * 放在伴生对象上是为了让脚本运行时也读得到：见 [currentJob]。
          */
         private val parentJob = ThreadLocal<Job?>()
+        private val currentSource = ThreadLocal<SourceScope?>()
 
         /** 此刻这根线程上跑的那次引擎调用的 Job；脚本运行时靠它响应取消（RhinoScriptRuntime） */
         internal fun currentJob(): Job? = parentJob.get()
 
+        internal fun currentInvocation(): Any? = currentSource.get()
+
         /** `java.ajaxAll` 同时在飞的请求数 */
         private const val AJAX_ALL_PARALLEL = 6
+        private val AUTH_HEADER_NAMES = setOf("Authorization", "Proxy-Authorization", "Cookie")
     }
 
     override fun fetch(
@@ -69,8 +114,21 @@ class EngineJsHttp(
         headers: Map<String, String>,
         followRedirects: Boolean,
     ): StrResponse? = runCatching {
-        blockingUnderParent { request(url, method, body, headers, followRedirects) }
+        val scope = currentSource.get()
+        blockingUnderParent { request(url, method, body, headers, followRedirects, scope) }
     }.getOrNull()
+
+    internal fun fetchBinary(
+        url: String, method: String, body: ByteArray?, headers: Map<String, String>, timeoutMs: Long,
+    ): StrResponse? {
+        val scope = currentSource.get() ?: return null
+        return blockingUnderParent {
+            withTimeout(timeoutMs) {
+                // ISO-8859-1 将每个字节一对一映射，复用已有的正文编码与来源会话链路。
+                request(url, method, body?.toString(Charsets.ISO_8859_1), headers, false, scope, "ISO-8859-1")
+            }
+        }
+    }
 
     /**
      * `java.ajaxAll`：一起发、同一道看门（外层一取消，整批一起掐掉）。同时在飞的封顶 [AJAX_ALL_PARALLEL] 个：
@@ -78,13 +136,14 @@ class EngineJsHttp(
      */
     override fun fetchAll(requests: List<JsHttpRequest>): List<StrResponse?> =
         runCatching {
+            val scope = currentSource.get()
             blockingUnderParent {
                 val gate = Semaphore(AJAX_ALL_PARALLEL)
                 requests.map { r ->
                     async {
                         gate.withPermit {
                             try {
-                                request(r.url, r.method, r.body, r.headers, followRedirects = true)
+                                request(r.url, r.method, r.body, r.headers, followRedirects = true, scope = scope)
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (_: Exception) {
@@ -96,48 +155,60 @@ class EngineJsHttp(
             }
         }.getOrNull() ?: requests.map { null }
 
-    override fun fetchBinary(url: String, method: String, body: ByteArray?, headers: Map<String, String>, timeoutMs: Long): StrResponse? =
-        blockingUnderParent {
-            withTimeout(timeoutMs.coerceIn(1, 45_000)) {
-                // ISO-8859-1 是逐字节的往返载体；不经 UTF-8 重编码，不自动重发提交请求。
-                val page = http.fetch(url, method, body?.toString(Charsets.ISO_8859_1), headers,
-                    charsetOverride = "ISO-8859-1", throwOnHttpError = false, followRedirects = false,
-                    maxResponseBytes = SCRIPT_BUFFER_LIMIT.toLong(), retryTransientErrors = false)
-                StrResponse(page.bodyText, page.statusCode, page.finalUrl, page.headers)
-            }
-        }
-
     private suspend fun request(
         url: String,
         method: String,
         body: String?,
         headers: Map<String, String>,
         followRedirects: Boolean,
+        scope: SourceScope?,
+        binaryCharset: String? = null,
     ): StrResponse {
+        val loginNames = if (headers.isEmpty() || scope == null) emptySet()
+        else scope.loginHeaderNames() + scope.observedLoginHeaderNames
+        val persisted = headers.keys.filterTo(mutableSetOf()) { name ->
+            loginNames.any { it.equals(name, ignoreCase = true) }
+        }
+        val scopedHeaders = if (persisted.isNotEmpty() && scope?.allowsLoginOrigin?.invoke(url) == false) {
+            headers - persisted
+        } else {
+            headers
+        }
+        val credentialHeaders = scopedHeaders.keys.filterTo(mutableSetOf()) { name ->
+            name in persisted || AUTH_HEADER_NAMES.any { it.equals(name, ignoreCase = true) }
+        }
+        scope?.requests?.incrementAndGet()
+        val sent = if (scope == null || scopedHeaders.keys.any { it.equals("User-Agent", ignoreCase = true) }) {
+            scopedHeaders
+        } else {
+            scope.userAgent()?.let { scopedHeaders + ("User-Agent" to it) } ?: scopedHeaders
+        }
         // 4xx/5xx 也要交给脚本看 statusCode，不能在这儿抛成 ajax 空串
         val page = http.fetch(
-            url, method = method, body = body, headers = headers,
+            url, method = method, body = body, headers = sent,
+            charsetOverride = binaryCharset,
             throwOnHttpError = false,
             followRedirects = followRedirects,
+            sourceId = scope?.id,
+            credentialHeaders = credentialHeaders,
+            binaryScriptRequest = binaryCharset != null,
         )
         return StrResponse(
             bodyText = page.bodyText,
             status = page.statusCode,
             finalUrl = page.finalUrl,
             headerMap = page.headers,
-            cookieStr = http.cookieOf(page.finalUrl),
+            cookieStr = http.cookieOf(page.finalUrl, scope?.id),
         )
     }
 
     /** 外层已取消返回 null；否则阻塞跑完 [block]（整段最多 [timeout]），外层一取消就掐掉 */
-    private fun <T> blockingUnderParent(block: suspend CoroutineScope.() -> T): T? {
+    internal fun <T> blockingUnderParent(block: suspend CoroutineScope.() -> T): T? {
         val parent = parentJob.get()
         // 外层已经取消了就别再发：同一段脚本里后面的 java.ajax、目录逐条执行的脚本都会走到这里，
         // 每一个都会实打实跑完一整个请求（最长 [timeout]），用户早就离开了页面
         if (parent?.isCancelled == true) return null
-        return runBlocking(com.radium.inkwell.core.source.auth.SourceRequestSession.binding(
-            com.radium.inkwell.core.source.auth.SourceRequestSession.current(),
-        )) {
+        return runBlocking {
             val blockingScope = this
             // 看门协程**挂在外层 Job 之下**：父一进入 cancelling，子立刻被取消 —— 这才是我们要的
             // 「外层取消」信号。从前写的是 `p.join()`，等的却是父「完成」；而父此刻正被这个
@@ -165,9 +236,9 @@ class EngineJsHttp(
         }
     }
 
-    override fun cookieOf(url: String): String = http.cookieOf(url)
+    override fun cookieOf(url: String): String = http.cookieOf(url, currentSource.get()?.id)
 
-    override fun setCookie(url: String, cookie: String) = http.setCookie(url, cookie)
+    override fun setCookie(url: String, cookie: String) = http.setCookie(url, cookie, currentSource.get()?.id)
 
-    override fun removeCookie(url: String) = http.removeCookie(url)
+    override fun removeCookie(url: String) = http.removeCookie(url, currentSource.get()?.id)
 }

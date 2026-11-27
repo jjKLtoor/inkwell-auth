@@ -4,19 +4,20 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
-import android.webkit.WebViewClient
+import androidx.webkit.CustomHeader
+import androidx.webkit.Profile
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import androidx.core.net.toUri
 import com.radium.inkwell.core.source.FetchedPage
-import com.radium.inkwell.core.source.AuthenticatedPageRenderer
-import com.radium.inkwell.core.source.auth.SourceRequestSession
-import com.radium.inkwell.sourceauth.AuthenticatedWebViewProfile
-import java.io.IOException
-import kotlin.coroutines.resumeWithException
+import com.radium.inkwell.core.source.PageRenderer
+import com.radium.inkwell.core.source.sourceOrigin
 import com.radium.inkwell.core.source.isPrivateNetworkHost
 import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -32,68 +33,82 @@ import org.json.JSONTokener
  * WebView 只能在主线程上操作，且一个实例同时只能加载一个页面，故全局串行化（Mutex）。
  * 这也是引擎不在搜索阶段回退到渲染的原因：并发扇出会在这里排成长队。
  */
-class WebViewPageRenderer(
+class WebViewPageRenderer internal constructor(
     private val context: Context,
     /** 单页渲染总超时；含加载与 JS 执行 */
     private val timeoutMs: Long = 25_000,
-    private val authenticatedGuard: () -> ((WebResourceRequest) -> WebResourceResponse?) = { WebViewNetworkGuard()::intercept },
-) : AuthenticatedPageRenderer {
+    private val sessions: SourceLoginSessions? = null,
+) : PageRenderer {
 
     private val mutex = Mutex()
-
-    override suspend fun renderAuthenticated(url: String, headers: Map<String, String>, userAgent: String?, session: SourceRequestSession): FetchedPage? {
-        if (!session.active || !session.scope.permits(url)) throw IOException("渲染地址超出当前来源认证范围")
-        val host = url.toUri().host ?: throw IOException("渲染地址无效")
-        if (withContext(Dispatchers.IO) { isPrivateNetworkHost(host) }) throw IOException("已阻止私网渲染地址")
-        if (!session.loginData["\$loginHeader"].isNullOrBlank() && session.loginData["\$loginHeader"]?.trim() != "{}") {
-            throw IOException("当前隔离网页渲染暂不支持认证 Header，不能按普通 Cookie 登录处理")
-        }
-        if (session.cookiesForRendering().isEmpty()) throw IOException("没有可供隔离网页恢复的 Cookie")
-        val safeHeaders = setOf("user-agent", "referer", "origin", "accept", "accept-language", "cache-control", "content-type")
-        if (headers.keys.any { it.lowercase() !in safeHeaders }) throw IOException("网页需要尚未支持的自定义请求头")
-        return AuthenticatedWebViewProfile.use(context, session, userAgent, authenticatedGuard()) { isolated ->
-            try {
-                withTimeout(timeoutMs) {
-                    isolated.prepare()
-                    loadPage(isolated.view, url, headers, isolated)
-                    val html = awaitSettledHtml(isolated.view, { isolated.networkIdle }, { isolated.networkRevision })
-                    isolated.failure?.let { throw IOException(it) }
-                    if (!session.active) throw IOException("来源会话已退出")
-                    isolated.capture()
-                    FetchedPage(isolated.view.url ?: url, 200, html, "utf-8")
-                }
-            } catch (error: TimeoutCancellationException) {
-                throw IOException(isolated.failure ?: "带认证网页渲染超时", error)
-            } catch (error: RenderFailed) {
-                throw IOException(isolated.failure ?: error.message ?: "带认证网页渲染失败", error)
-            }
-        }
-    }
 
     override suspend fun render(
         url: String,
         headers: Map<String, String>,
         userAgent: String?,
+    ): FetchedPage? = renderWithProfile(url, headers, userAgent, null, emptyMap())
+
+    override suspend fun renderForSource(
+        sessionId: String?,
+        url: String,
+        headers: Map<String, String>,
+        userAgent: String?,
+        credentialHeaders: Map<String, String>,
+    ): FetchedPage? {
+        val target = url.sourceLoginHttpUrl()
+        if (credentialHeaders.isNotEmpty() && (target == null || sessionId == null)) return null
+        val profile = if (sessionId != null && target != null &&
+            (credentialHeaders.isNotEmpty() || sessions?.hasWebLogin(sessionId, target) == true)
+        ) loginProfileName(sessionId) else null
+        return renderWithProfile(url, headers, userAgent, profile, credentialHeaders)
+    }
+
+    private suspend fun renderWithProfile(
+        url: String,
+        headers: Map<String, String>,
+        userAgent: String?,
+        profile: String?,
+        credentialHeaders: Map<String, String>,
     ): FetchedPage? {
         // 书源给的地址先过一道内网判定（要解析 DNS，不能在主线程）。拦下来就返回 null：
         // 引擎退回静态抓取，那条路上的 OkHttp 会以「拒绝访问内网地址」报出来
         val host = url.toUri().host ?: return null
         if (withContext(Dispatchers.IO) { isPrivateNetworkHost(host) }) return null
-        return renderLocked(url, headers, userAgent)
+        return renderLocked(url, headers, userAgent, profile, credentialHeaders)
     }
 
     private suspend fun renderLocked(
         url: String,
         headers: Map<String, String>,
         userAgent: String?,
+        profile: String?,
+        credentialHeaders: Map<String, String>,
     ): FetchedPage? = mutex.withLock {
         withContext(Dispatchers.Main) {
+            if (credentialHeaders.isNotEmpty() &&
+                (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE) ||
+                    !WebViewFeature.isFeatureSupported(WebViewFeature.CUSTOM_REQUEST_HEADERS))
+            ) return@withContext null
             var view: WebView? = null
+            var configuredProfile: Profile? = null
+            val registered = mutableListOf<CustomHeader>()
             try {
                 withTimeout(timeoutMs) {
-                    val wv = createWebView(userAgent)
+                    val wv = createWebView(userAgent, profile)
                     view = wv
-                    loadPage(wv, url, headers)
+                    if (credentialHeaders.isNotEmpty()) {
+                        val origin = requireNotNull(url.sourceLoginHttpUrl()).sourceOrigin().toString().removeSuffix("/")
+                        val current = WebViewCompat.getProfile(wv)
+                        configuredProfile = current
+                        credentialHeaders.forEach { (name, value) ->
+                            val header = CustomHeader(name, value, setOf(origin))
+                            current.addCustomHeader(header)
+                            registered += header
+                        }
+                    }
+                    // 加载完成后还要轮询 DOM；进程退出时一并取消这两段等待。
+                    val renderJob = coroutineContext.job
+                    loadPage(wv, url, headers) { renderJob.cancel(RendererGone()) }
                     val html = awaitSettledHtml(wv)
                     FetchedPage(
                         finalUrl = wv.url ?: url,
@@ -104,21 +119,31 @@ class WebViewPageRenderer(
                 }
             } catch (e: TimeoutCancellationException) {
                 null // 超时 → 调用方沿用静态抓取的结果
+            } catch (_: RendererGone) {
+                null
             } catch (e: RenderFailed) {
                 null
+            } catch (_: IllegalArgumentException) {
+                null
             } finally {
-                view?.let {
-                    it.stopLoading()
-                    it.destroy() // 每次用完即销毁：长期持有的离屏 WebView 容易泄漏 Activity/内存
+                view?.destroy()
+                configuredProfile?.let { current ->
+                    registered.forEach { current.clearCustomHeader(it.name, it.value) }
                 }
             }
         }
     }
 
+    private class RendererGone : CancellationException(WEB_RENDERER_ERROR)
+
     private class RenderFailed(message: String) : Exception(message)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(userAgent: String?): WebView = WebView(context).apply {
+    private fun createWebView(userAgent: String?, profile: String?): WebView = WebView(context).apply {
+        if (profile != null && WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+            WebViewCompat.setProfile(this, profile)
+            settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        }
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         // 正文只需要 DOM，图片按书源规则里的 URL 另行下载，这里不必真的拉图
@@ -131,52 +156,31 @@ class WebViewPageRenderer(
     }
 
     /** 加载页面，等 onPageFinished；主文档加载失败直接放弃 */
-    private suspend fun loadPage(wv: WebView, url: String, headers: Map<String, String>, isolated: AuthenticatedWebViewProfile? = null) =
-        suspendCancellableCoroutine { cont ->
-            val guard = WebViewNetworkGuard()
-            wv.webViewClient = object : WebViewClient() {
-                /**
-                 * 页面里的脚本、XHR、子框架同样不许碰内网（见 [WebViewNetworkGuard]）：否则渲染一个公网页，
-                 * 它的脚本就能去读 `http://192.168.1.1/`，再由规则里的 `java.ajax` 把结果发回书源作者的服务器。
-                 */
-                override fun shouldInterceptRequest(
-                    view: WebView,
-                    request: WebResourceRequest,
-                ): WebResourceResponse? = if (isolated != null) isolated.intercept(request) else guard.intercept(request)
+    private suspend fun loadPage(
+        wv: WebView,
+        url: String,
+        headers: Map<String, String>,
+        onRendererGone: (WebView) -> Unit,
+    ) = suspendCancellableCoroutine { cont ->
+        wv.webViewClient = object : GuardedWebViewClient(onRendererGone) {
+            override fun onPageFinished(view: WebView, finishedUrl: String) {
+                if (cont.isActive) cont.resume(Unit)
+            }
 
-                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val denied = isolated?.blocksNavigation(request) ?: guard.blocksNavigation(request)
-                    if (denied && request.isForMainFrame && cont.isActive) cont.resumeWithException(RenderFailed(isolated?.failure ?: "已阻止不安全跳转"))
-                    return denied
-                }
-
-                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
-                    if (request.isForMainFrame && cont.isActive) cont.resumeWithException(RenderFailed("网页返回 HTTP " + response.statusCode))
-                }
-
-                override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError) {
-                    handler.cancel()
-                    if (cont.isActive) cont.resumeWithException(RenderFailed("网页证书校验失败"))
-                }
-
-                override fun onPageFinished(view: WebView, finishedUrl: String) {
-                    if (cont.isActive) cont.resume(Unit)
-                }
-
-                override fun onReceivedError(
-                    view: WebView,
-                    request: WebResourceRequest,
-                    error: WebResourceError,
-                ) {
-                    // 只有主文档失败才算失败：子资源（图片/统计脚本）报错很常见，忽略
-                    if (request.isForMainFrame && cont.isActive) {
-                        cont.resumeWithException(RenderFailed("加载失败（代码 " + error.errorCode + "）"))
-                    }
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError,
+            ) {
+                // 只有主文档失败才算失败：子资源（图片/统计脚本）报错很常见，忽略
+                if (request.isForMainFrame && cont.isActive) {
+                    cont.cancel(RenderFailed("加载失败: ${error.description}"))
                 }
             }
-            // Referer 等源级头随首次请求带上；WebView 不会把它们带到后续 XHR，够用
-            wv.loadUrl(url, headers.filterKeys { !it.equals("User-Agent", ignoreCase = true) })
         }
+        // Referer 等源级头随首次请求带上；WebView 不会把它们带到后续 XHR，够用
+        wv.loadUrl(url, headers.filterKeys { !it.equals("User-Agent", ignoreCase = true) })
+    }
 
     /**
      * onPageFinished 只代表主文档就绪，正文往往还在 XHR 途中。
@@ -187,22 +191,18 @@ class WebViewPageRenderer(
      * 阅读页翻到要渲染的章节时，翻页动画正好跟它抢主线程。只比长度又不够：定长的占位（补齐的「加载中…」、
      * 倒计时）换成正文前长度可能不变，会被当成已经渲染完。哈希在渲染进程里算，几十万字符一遍是几毫秒。
      */
-    private suspend fun awaitSettledHtml(wv: WebView, networkIdle: () -> Boolean = { true }, networkRevision: () -> Long = { 0 }): String {
+    private suspend fun awaitSettledHtml(wv: WebView): String {
         var last = ""
         var stable = 0
-        var lastRevision = networkRevision()
         repeat(MAX_POLLS) {
             delay(POLL_INTERVAL_MS)
             val signature = readHtmlSignature(wv)
-            val revision = networkRevision()
-            // DOM 暂时不变不能代表异步取页完成；请求期间及请求版本变化后重新观察稳定性。
-            if (networkIdle() && revision == lastRevision && signature.isNotEmpty() && !signature.startsWith("0:") && signature == last) {
+            if (signature.isNotEmpty() && !signature.startsWith("0:") && signature == last) {
                 if (++stable >= 2) return readHtml(wv).ifEmpty { throw RenderFailed("渲染后页面为空") }
             } else {
                 stable = 0
                 last = signature
             }
-            lastRevision = revision
         }
         return readHtml(wv).ifEmpty { throw RenderFailed("渲染后页面为空") }
     }
@@ -230,7 +230,7 @@ class WebViewPageRenderer(
     private companion object {
         const val POLL_INTERVAL_MS = 350L
         /** 页面签名：长度 + 整串的 31 进制滚动哈希（|0 截成 32 位整数） */
-        const val SIGNATURE_JS = "(function(){if(document.readyState!=='complete')return '';var s=document.documentElement.outerHTML,h=0;" +
+        const val SIGNATURE_JS = "(function(){var s=document.documentElement.outerHTML,h=0;" +
             "for(var i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))|0}return s.length+':'+h})()"
         const val MAX_POLLS = 24 // 与 timeoutMs 共同兜底；连续两次稳定就提前返回
     }

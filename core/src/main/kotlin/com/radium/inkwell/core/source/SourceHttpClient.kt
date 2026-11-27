@@ -1,22 +1,26 @@
 package com.radium.inkwell.core.source
 
-import com.radium.inkwell.core.source.auth.SourceRequestSession
-import kotlinx.serialization.json.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.Json
 import kotlin.coroutines.resumeWithException
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Connection
+import okhttp3.EventListener
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -85,6 +89,8 @@ class FetchedPage(
     val detectedCharset: String,
     /** 响应头（同名多值保留）；脚本里的 `StrResponse.headers(name)` 靠它 */
     val headers: Map<String, List<String>> = emptyMap(),
+    /** HTTP 跳转链最后一次实际发出的方法；合成响应不提供此值。 */
+    val requestMethod: String? = null,
 )
 
 /**
@@ -102,20 +108,46 @@ class SourceHttpClient(
     /** 允许书源访问内网地址。**只该在测试里开**（MockWebServer 跑在 127.0.0.1 上） */
     allowPrivateNetwork: Boolean = false,
     private val logger: SourceHttpLogger = SourceHttpLogger.NONE,
-    /** WebView 代理已由独立 profile 管理 Cookie，不能再让 OkHttp 的缓存覆盖浏览器最新值。 */
-    useMemoryCookieJar: Boolean = true,
+    /** 仅返回这个来源显式登录的站点、且匹配请求地址的网页 Cookie。 */
+    private val webCookies: (sourceId: String, url: HttpUrl) -> String? = { _, _ -> null },
+    private val sessionStore: SourceSessionStore? = null,
+    private val updateWebCookies: (String, HttpUrl, List<Cookie>) -> Unit = { _, _, _ -> },
+    private val clearWebCookies: (String, HttpUrl) -> Unit = { _, _ -> },
 ) {
-
-    private fun safeLog(warn: Boolean, message: String, error: Throwable?) {
-        if (SourceRequestSession.current() != null) logger.log(warn, "来源会话请求（详细地址和异常已隐藏）", null)
-        else logger.log(warn, message, error)
-    }
 
     private val cookieJar = MemoryCookieJar()
 
     private val client: OkHttpClient = baseClient.newBuilder()
-        .cookieJar(if (useMemoryCookieJar) cookieJar else CookieJar.NO_COOKIES)
+        .cookieJar(cookieJar)
         .guardPrivateNetwork(allowPrivate = allowPrivateNetwork)
+        .addNetworkInterceptor { chain ->
+            var request = chain.request()
+            val scope = request.tag(SourceRequest::class.java)
+            if (scope != null && scope.credentialHeaders.isNotEmpty() && request.url.sourceOrigin() != scope.origin) {
+                request = request.newBuilder().apply {
+                    scope.credentialHeaders.forEach(::removeHeader)
+                    if (scope.credentialHeaders.any { it.equals("Cookie", ignoreCase = true) }) {
+                        val cookies = nativeCookies(scope.sessionId, request.url)
+                        if (cookies.isNotEmpty()) header("Cookie", cookies)
+                    }
+                }.build()
+            }
+            val web = scope?.sessionId?.let { webCookies(it, request.url) }
+            val loginUa = scope?.sessionId?.let { sessionStore.webLoginUserAgent(it, request.url) }
+                ?.takeIf { it.isNotBlank() && isValidHeaderValue(it) }
+            // 网页 Cookie 每跳按实际地址重新取，跟随重定向时由目标站的 origin 决定。
+            val cookies = web?.takeIf(String::isNotBlank)
+                ?.let { mergeWebCookies(request.header("Cookie").orEmpty(), it) }
+                ?.takeIf(::isValidHeaderValue)
+            if (cookies != null || loginUa != null) {
+                request = request.newBuilder().apply {
+                    if (cookies != null) header("Cookie", cookies)
+                    // UA 也是网页会话的一部分。每跳独立匹配 origin，跨站后仍用来源原有的 UA。
+                    if (loginUa != null) header("User-Agent", loginUa)
+                }.build()
+            }
+            chain.proceed(request)
+        }
         // 超时必须显式配：OkHttp 默认 connect/read/write 各 10 秒，且**没有 callTimeout**。
         // 没有总闸的话，一个每 9 秒吐一个字节的站能把这次调用无限期挂住 —— 而书源脚本那条路
         // 是 runBlocking 阻塞等待的（见 EngineJsHttp），挂住的是一整根 IO 线程，
@@ -127,75 +159,113 @@ class SourceHttpClient(
         .callTimeout(CALL_TIMEOUT)
         .build()
 
-    /**
-     * 不跟随重定向的那一份（脚本的 `java.get/post/head`，见 JsHttp.fetch）。由 [client] 派生：连接池、Cookie、
-     * 私网防护（DNS 与拦截器）、超时都是同一套
-     */
-    private val noRedirectClient: OkHttpClient = client.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
-
-    /** Legado 也接受裸主机名；只在当前获准的 HTTPS 作用域内补全，不能借此读取其它站点身份。 */
-    private fun cookieUrl(value: String): HttpUrl? {
-        value.toHttpUrlOrNull()?.let { return it }
-        val session = SourceRequestSession.current() ?: return null
-        return session.scope.originUrls.mapNotNull { it.toHttpUrlOrNull() }
-            .firstOrNull { it.port == 443 && it.host.equals(value.trim(), ignoreCase = true) }
+    private class SessionClient(val client: OkHttpClient, val jar: MemoryCookieJar) {
+        val noRedirect = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
     }
 
-    /** 书源脚本要读写 cookie（登录态、防盗链 token 都靠它） */
-    fun cookieOf(url: String): String = cookieUrl(url)
-        ?.let { u -> (SourceRequestSession.current() ?: cookieJar).loadForRequest(u).joinToString("; ") { "${it.name}=${it.value}" } }
-        .orEmpty()
-
-    fun setCookie(url: String, cookie: String) {
-        val u = cookieUrl(url) ?: return
-        val cookies = cookie.split(';').mapNotNull { Cookie.parse(u, it.trim()) }
-        (SourceRequestSession.current() ?: cookieJar).saveFromResponse(u, cookies)
+    private val sharedSession = SessionClient(client, cookieJar)
+    private class WarmConnection(val origin: HttpUrl, val ready: CompletableDeferred<Unit> = CompletableDeferred())
+    @Volatile private var warming: WarmConnection? = null
+    private val warmupClient by lazy {
+        client.newBuilder().cookieJar(CookieJar.NO_COOKIES)
+            .followRedirects(false).retryOnConnectionFailure(false)
+            .callTimeout(4.seconds.toJavaDuration()).build()
     }
 
-    fun removeCookie(url: String) {
-        cookieUrl(url)?.let { url ->
-            val session = SourceRequestSession.current()
-            if (session == null) cookieJar.clear(url) else session.saveFromResponse(url, session.loadForRequest(url).map { it.newBuilder().expiresAt(0).build() })
+    /** 与搜索共用连接池。只向站点根路径发匿名 HEAD，不运行规则、提交搜索或接收登录 Cookie。 */
+    internal suspend fun warmSearchConnection(url: HttpUrl) {
+        if (!url.isHttps || isPrivateNetworkLiteral(url.host)) return
+        val pending = WarmConnection(url.sourceOrigin())
+        val call = warmupClient.newCall(Request.Builder().url(pending.origin).head().build())
+        call.addEventListener(object : EventListener() {
+            override fun connectionAcquired(call: Call, connection: Connection) {
+                // HTTP/2 可同时发搜索和 HEAD；HTTP/1 要等 HEAD 归还连接。
+                if (connection.protocol() == Protocol.HTTP_2) pending.ready.complete(Unit)
+            }
+        })
+        warming = pending
+        try {
+            execute(call).close()
+        } catch (_: IOException) {
+            // 搜索仍按原路径独立发起。
+        } finally {
+            warming = null
+            pending.ready.complete(Unit)
         }
     }
 
-    /** 每跳重新校验作用域和撤销状态，禁止跨域及跨端口发送身份。 */
-    private fun requestClient(redirects: Boolean): OkHttpClient {
-        val base = if (redirects) client else noRedirectClient
-        val session = SourceRequestSession.current() ?: return base
-        val originalHeaderNames = runCatching {
-            (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject).keys.toSet()
-        }.getOrDefault(emptySet())
-        return base.newBuilder().cookieJar(session).addInterceptor { chain ->
-            if (session.restrictNetworkToScope && (!session.active || !session.scope.permits(chain.request().url.toString()))) {
-                throw IOException("来源登录请求超出已授权认证范围")
-            }
-            chain.proceed(chain.request())
-        }.addNetworkInterceptor { chain ->
-            val request = chain.request()
-            if (session.restrictNetworkToScope && (!session.active || !session.scope.permits(request.url.toString()))) {
-                throw IOException("来源登录请求超出已授权认证范围")
-            }
-            val builder = request.newBuilder()
-            val saved = runCatching {
-                (Json.parseToJsonElement(session.loginData["\$loginHeader"] ?: "{}") as JsonObject)
-                    .mapValues { (_, v) -> (v as JsonPrimitive).content }
-            }.getOrDefault(emptyMap())
-            val permitted = session.active && session.scope.permits(request.url.toString())
-            val sensitive = saved.keys + originalHeaderNames + setOf("Cookie", "Authorization", "Proxy-Authorization")
-            if (!permitted) sensitive.forEach { builder.removeHeader(it) }
-            else {
-                if (!session.scope.permitsPrimary(request.url.toString())) sensitive.forEach { builder.removeHeader(it) }
-                val cookies = session.loadForRequest(request.url)
-                if (cookies.isNotEmpty()) builder.header("Cookie", cookies.joinToString("; ") { it.name + "=" + it.value })
-                (if (session.scope.permitsPrimary(request.url.toString())) saved else emptyMap()).filterKeys { !(it.equals("Cookie", true) && cookies.isNotEmpty()) && !it.equals("Host", true) && !it.equals("Content-Length", true) }
-                    .forEach { (name, value) -> if (isValidHeaderName(name) && isValidHeaderValue(value)) builder.header(name, value) }
-            }
-            chain.proceed(builder.build())
-        }.build()
+    internal suspend fun awaitSearchConnection(url: String) {
+        val pending = warming ?: return
+        if (url.toHttpUrlOrNull()?.sourceOrigin() == pending.origin) {
+            // 已在握手时给它短暂的先机；失效的预连接不能拖到四秒总超时。
+            withTimeoutOrNull(1_000) { pending.ready.await() }
+        }
+    }
+    private val sourceSessions = ConcurrentHashMap<String, SessionClient>()
+
+    private fun clientSession(sourceId: String?): SessionClient = if (sourceId == null) sharedSession else {
+        sourceSessions.computeIfAbsent(sourceId) { id ->
+            val initial = sessionStore?.read(id, SourceSessionKey.COOKIES)?.let(::decodeCookies).orEmpty()
+            val jar = MemoryCookieJar(
+                maxCookies = 256,
+                initial = initial,
+                save = { cookies ->
+                    val persistent = cookies.filter { it.persistent }
+                    val serialized = persistent.takeIf { it.isNotEmpty() }?.let { saved ->
+                        Json.encodeToString(saved.map { "${it.domain}\n$it" })
+                    }
+                    sessionStore?.write(id, SourceSessionKey.COOKIES, serialized)
+                },
+                onResponse = { url, cookies -> updateWebCookies(id, url, cookies) },
+            )
+            SessionClient(client.newBuilder().cookieJar(jar).build(), jar)
+        }
+    }
+
+    private fun decodeCookies(saved: String): List<Cookie> =
+        runCatching { Json.decodeFromString<List<String>>(saved) }.getOrDefault(emptyList()).mapNotNull { item ->
+            val host = item.substringBefore('\n')
+            val url = runCatching { HttpUrl.Builder().scheme("https").host(host).build() }.getOrNull()
+            url?.let { Cookie.parse(it, item.substringAfter('\n', "")) }
+        }
+
+    /** 书源脚本要读写 cookie（登录态、防盗链 token 都靠它） */
+    fun cookieOf(url: String, sourceId: String? = null): String = cookieUrl(url)
+        ?.let { target ->
+            val local = nativeCookies(sourceId, target)
+            val web = sourceId?.let { webCookies(it, target) }
+            if (web.isNullOrBlank()) local else mergeWebCookies(local, web)
+        }.orEmpty()
+
+    /** 阅读脚本的 Cookie 接口也接受纯域名，例如网页登录后传入站点域名取会话。 */
+    private fun cookieUrl(value: String): HttpUrl? = value.toHttpUrlOrNull()
+        ?: runCatching { HttpUrl.Builder().scheme("https").host(value).build() }.getOrNull()
+
+    private fun nativeCookies(sessionId: String?, target: HttpUrl): String =
+        clientSession(sessionId).jar.loadForRequest(target).joinToString("; ") { "${it.name}=${it.value}" }
+
+    private fun mergeWebCookies(local: String, web: String): String {
+        val authenticatedNames = web.split(';').mapTo(HashSet()) { it.substringBefore('=').trim() }
+        val otherCookies = local.split(';').map(String::trim)
+            .filter { it.isNotEmpty() && it.substringBefore('=') !in authenticatedNames }
+        return (listOf(web) + otherCookies).joinToString("; ")
+    }
+
+    private data class SourceRequest(val sessionId: String?, val origin: HttpUrl, val credentialHeaders: Set<String>)
+
+    fun setCookie(url: String, cookie: String, sourceId: String? = null) {
+        val u = cookieUrl(url) ?: return
+        // 脚本写的同阅读的 CookieStore.setCookie，存下来、重启后还在：登录脚本常这样存登录态。没写过期时间的在 OkHttp 里
+        // 是会话 Cookie、不落盘（见 clientSession），补一个远期的。服务端下发的会话 Cookie 不动，同阅读只留在这一次运行里
+        val cookies = cookie.split(';').mapNotNull { Cookie.parse(u, it.trim()) }
+            .map { if (it.persistent) it else it.newBuilder().expiresAt(Long.MAX_VALUE).build() }
+        clientSession(sourceId).jar.saveFromResponse(u, cookies)
+    }
+
+    fun removeCookie(url: String, sourceId: String? = null) {
+        val target = cookieUrl(url) ?: return
+        clientSession(sourceId).jar.clear(target)
+        if (sourceId != null) clearWebCookies(sourceId, target)
     }
 
     private val buckets = ConcurrentHashMap<String, TokenBucket>()
@@ -216,38 +286,43 @@ class SourceHttpClient(
         throwOnHttpError: Boolean = true,
         /** false：3xx 原样交回（带着 Location），不往下跳 */
         followRedirects: Boolean = true,
-        maxResponseBytes: Long = MAX_BODY_BYTES,
-        retryTransientErrors: Boolean = true,
+        sourceId: String? = null,
+        credentialHeaders: Set<String> = emptySet(),
+        binaryScriptRequest: Boolean = false,
     ): FetchedPage {
         dataUriPage(url)?.let { return it }
         val httpUrl = url.toHttpUrlOrNull() ?: throw IOException("非法 URL: $url")
+        // 二进制脚本请求可能在路径或查询串带会话参数，诊断只记站点。
+        val logUrl = if (binaryScriptRequest) httpUrl.sourceOrigin().toString() else url
         if (rateLimit != null && rateLimit.intervalMs > 0) {
             buckets.computeIfAbsent(httpUrl.host) { TokenBucket(rateLimit) }.acquire()
         }
+        val session = clientSession(sourceId)
         var attempt = 0
         var disconnectRetried = false
         while (true) {
-            val request = buildRequest(httpUrl, method, body, headers, charsetOverride)
+            val request = buildRequest(httpUrl, method, body, headers, charsetOverride, sourceId, credentialHeaders)
             val startNs = System.nanoTime()
             val response = try {
-                execute(requestClient(followRedirects).newCall(request))
+                execute((if (followRedirects) session.client else session.noRedirect).newCall(request))
             } catch (e: IOException) {
                 // 握手/发请求时被 RST（报错就是一句干巴巴的「Connection reset」）多半是瞬时的：
                 // 连接池里的旧连接被服务端单方面关了、移动网络切基站。再试一次就好，用户却得
                 // 自己点重试。只重试 GET/HEAD —— POST 可能已经送达，重放会把提交做两遍。
                 // 一次为限：被防火墙或 WAF 稳定掐断的站，再试多少次都一样，只是让人多等。
-                if (retryTransientErrors && !disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
+                if (!binaryScriptRequest && !disconnectRetried && method.isIdempotent() && e.isDisconnect()) {
                     disconnectRetried = true
-                    safeLog(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
+                    logger.log(true, "$method $url 连接被断开（${e.describe()}），重试一次", e)
                     delay(retryBaseDelayMs)
                     continue
                 }
-                safeLog(true, "$method $url 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
+                if (binaryScriptRequest) logger.log(true, "$method $logUrl 请求失败（${elapsedMs(startNs)}ms）", null)
+                else logger.log(true, "$method $logUrl 请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
                 throw e
             }
             val hasRateLimitDelay = response.code == 429 && !response.header("Retry-After").isNullOrBlank()
-            if (retryTransientErrors && response.code in RETRY_CODES && attempt < MAX_RETRIES && !hasRateLimitDelay) {
-                safeLog(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
+            if (!binaryScriptRequest && response.code in RETRY_CODES && attempt < MAX_RETRIES && !hasRateLimitDelay) {
+                logger.log(true, "$method $url → HTTP ${response.code}，第 ${attempt + 1} 次退避重试", null)
                 response.close()
                 delay(retryBaseDelayMs shl attempt) // 指数退避：base、base*2
                 attempt++
@@ -255,19 +330,20 @@ class SourceHttpClient(
             }
             response.use { resp ->
                 if (throwOnHttpError && !resp.isSuccessful) {
-                    safeLog(true, "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms）", null)
+                    logger.log(true, "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms）", null)
                     throw HttpStatusException(resp.code, url, resp.header("Retry-After"))
                 }
                 val bytes = try {
-                    withContext(Dispatchers.IO) { readBounded(resp, url, maxResponseBytes.coerceIn(1, MAX_BODY_BYTES)) }
+                    withContext(Dispatchers.IO) { readBounded(resp, url) }
                 } catch (e: IOException) {
-                    safeLog(true, "$method $url → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
+                    if (binaryScriptRequest) logger.log(true, "$method $logUrl → HTTP ${resp.code}，读响应体失败", null)
+                    else logger.log(true, "$method $logUrl → HTTP ${resp.code}，读响应体失败: ${e.describe()}", e)
                     throw e
                 }
                 val charset = detectCharset(charsetOverride, resp.header("Content-Type"), bytes)
-                safeLog(
+                logger.log(
                     false,
-                    "$method $url → HTTP ${resp.code}（${elapsedMs(startNs)}ms，${bytes.size} B，${charset.name()}）",
+                    "$method $logUrl → HTTP ${resp.code}（${elapsedMs(startNs)}ms，${bytes.size} B，${charset.name()}）",
                     null,
                 )
                 return FetchedPage(
@@ -276,6 +352,7 @@ class SourceHttpClient(
                     bodyText = String(bytes, charset),
                     detectedCharset = charset.name(),
                     headers = resp.headers.toMultimap(),
+                    requestMethod = resp.request.method,
                 )
             }
         }
@@ -291,19 +368,21 @@ class SourceHttpClient(
         url: String,
         headers: Map<String, String> = emptyMap(),
         maxBytes: Long = MAX_IMAGE_BYTES,
+        sourceId: String? = null,
+        credentialHeaders: Set<String> = emptySet(),
     ): ByteArray {
         val httpUrl = url.toHttpUrlOrNull() ?: throw IOException("非法 URL: $url")
-        val request = buildRequest(httpUrl, "GET", null, headers, null)
+        val request = buildRequest(httpUrl, "GET", null, headers, null, sourceId, credentialHeaders)
         val startNs = System.nanoTime()
         val response = try {
-            execute(requestClient(true).newCall(request))
+            execute(clientSession(sourceId).client.newCall(request))
         } catch (e: IOException) {
-            safeLog(true, "GET $url（图片）请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
+            logger.log(true, "GET $url（图片）请求失败（${elapsedMs(startNs)}ms）: ${e.describe()}", e)
             throw e
         }
         response.use { resp ->
             if (!resp.isSuccessful) {
-                safeLog(true, "GET $url（图片）→ HTTP ${resp.code}", null)
+                logger.log(true, "GET $url（图片）→ HTTP ${resp.code}", null)
                 throw HttpStatusException(resp.code, url)
             }
             return withContext(Dispatchers.IO) { readBounded(resp, url, maxBytes) }
@@ -382,8 +461,13 @@ class SourceHttpClient(
         body: String?,
         headers: Map<String, String>,
         charsetOverride: String?,
+        sourceId: String?,
+        credentialHeaders: Set<String>,
     ): Request {
         val b = Request.Builder().url(httpUrl)
+        if (sourceId != null || credentialHeaders.isNotEmpty()) {
+            b.tag(SourceRequest::class.java, SourceRequest(sourceId, httpUrl.sourceOrigin(), credentialHeaders))
+        }
         var hasUa = false
         var contentType: String? = null
         headers.forEach { (k, v) ->
@@ -474,10 +558,22 @@ class SourceHttpClient(
         /**
          * 书源规则是照着这个 UA 抓到的页面写的，JS 渲染器必须沿用同一个，否则站点可能
          * 按 UA 给出另一套 DOM（创世中文网就会在移动 UA 下跳转到 m. 站），规则随即全部落空。
+         *
+         * 这是**我们自己**的 UA：「新建来源」的向导、登录网页之外的非来源请求用它，向导识别规则时看的就是这一套页面。
+         * 从阅读导入、自己没写 User-Agent 的来源发的是 [LEGADO_UA]，见 BookSourceRule.defaultUserAgent
          */
         const val DEFAULT_UA =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+        /**
+         * 阅读（Legado）在来源没写 User-Agent 时发的 UA：Windows 桌面版 Chrome（AppConfig.getPrefUserAgent，
+         * 版本号是它打包的 Cronet 主版本）。阅读的来源作者照着这一套页面写规则：发手机 UA 的话，站点跳去手机站、
+         * 给新版页面，规则对不上 —— 若夏的目录、瀚海书阁的详情、久久小说的搜索就是这么空的。
+         */
+        const val LEGADO_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
         private val RETRY_CODES = setOf(403, 429)
         private const val MAX_RETRIES = 2
@@ -521,23 +617,32 @@ class SourceHttpClient(
  * 现在不按 host 分桶，按条目总数封顶：超出时先清过期的，还不够再淘汰最早种下的。
  * 同名 + 同域 + 同路径的视为同一个，后种的替换先种的（RFC 6265 §5.3 第 11 步）。
  */
-internal class MemoryCookieJar(private val maxCookies: Int = MAX_COOKIES) : CookieJar {
+internal class MemoryCookieJar(
+    private val maxCookies: Int = MAX_COOKIES,
+    initial: List<Cookie> = emptyList(),
+    private val save: ((List<Cookie>) -> Unit)? = null,
+    private val onResponse: ((HttpUrl, List<Cookie>) -> Unit)? = null,
+) : CookieJar {
 
     private val lock = Any()
 
     /** 插入顺序 = 种下的先后（重种的挪到末尾），淘汰从头开始 */
-    private val cookies = LinkedHashMap<String, Cookie>()
+    private val cookies = LinkedHashMap<String, Cookie>().apply {
+        initial.filter { it.expiresAt > System.currentTimeMillis() }
+            .takeLast(maxCookies).forEach { put(keyOf(it), it) }
+    }
 
     val size: Int get() = synchronized(lock) { cookies.size }
 
     /** 删掉会发给这个 host 的全部 cookie（脚本的 `cookie.removeCookie(url)`） */
     fun clear(url: HttpUrl) {
         synchronized(lock) {
-            cookies.values.removeAll { domainMatches(it, url.host) }
+            if (cookies.values.removeAll { domainMatches(it, url.host) }) saveCookies()
         }
     }
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        if (cookies.isEmpty()) return
         val now = System.currentTimeMillis()
         synchronized(lock) {
             for (c in cookies) {
@@ -547,6 +652,8 @@ internal class MemoryCookieJar(private val maxCookies: Int = MAX_COOKIES) : Cook
                 if (c.expiresAt > now) this.cookies[key] = c
             }
             if (this.cookies.size > maxCookies) evict(now)
+            saveCookies()
+            onResponse?.invoke(url, cookies)
         }
     }
 
@@ -565,6 +672,11 @@ internal class MemoryCookieJar(private val maxCookies: Int = MAX_COOKIES) : Cook
             }
             return out
         }
+    }
+
+    private fun saveCookies() {
+        val persist = save ?: return
+        runCatching { persist(cookies.values.toList()) }
     }
 
     private fun evict(now: Long) {

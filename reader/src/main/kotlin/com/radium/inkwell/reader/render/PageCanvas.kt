@@ -90,7 +90,7 @@ fun DrawScope.drawPageItems(
                 val handle = page.measured[item.elementIndex]?.renderHandle as? TextLayoutResult
                     ?: return@forEach
                 // 高亮先画，文字后画 —— 否则半透明的色块会盖在字上
-                if (selection != null && selection.elementIndex == item.elementIndex) {
+                if (selection != null && selection.covers(item.elementIndex)) {
                     drawSelection(
                         handle, item, selection,
                         left = contentLeft, top = originY,
@@ -242,6 +242,7 @@ fun renderPageBitmap(
 /**
  * 选区高亮。用与 drawTextSlice 完全相同的 translate + clipRect ——
  * 差一点点，色块就会飘到字的上方或糊到相邻页去。
+ * 跨段选区：起点那段从起点亮到段尾、终点那段从段首亮到终点，中间的段整段亮（clip 只留本页的行）。
  */
 private fun DrawScope.drawSelection(
     layoutResult: TextLayoutResult,
@@ -251,17 +252,20 @@ private fun DrawScope.drawSelection(
     top: Float,
     color: Color,
 ) {
-    val len = layoutResult.layoutInput.text.length
-    val start = selection.start.coerceIn(0, len)
-    val end = selection.end.coerceIn(start, len)
+    val visibleStart = layoutResult.getLineStart(slice.startLine)
+    val visibleEnd = layoutResult.getLineEnd(slice.endLine)
+    val start = if (slice.elementIndex == selection.elementIndex) maxOf(selection.start, visibleStart) else visibleStart
+    val end = if (slice.elementIndex == selection.endElementIndex) minOf(selection.end, visibleEnd) else visibleEnd
     if (end <= start) return
+    val highlight = Path()
+    layoutResult.forEachSelectionBox(start, end) { highlight.addRect(it) }
     val sliceTopInParagraph = layoutResult.getLineTop(slice.startLine)
     translate(left = left, top = top + slice.yTopInPage - sliceTopInParagraph) {
         clipRect(
             top = sliceTopInParagraph,
             bottom = layoutResult.getLineBottom(slice.endLine),
         ) {
-            drawPath(layoutResult.getPathForRange(start, end), color)
+            drawPath(highlight, color)
         }
     }
 }

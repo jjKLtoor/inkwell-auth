@@ -2,6 +2,7 @@ package com.radium.inkwell.core.source.js
 
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.UUID
 import java.util.zip.Inflater
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -19,36 +20,17 @@ import javax.crypto.spec.SecretKeySpec
  *
  * 我们的脚本沙箱只放行桥对象所在的包（[RhinoScriptRuntime.BRIDGE_ONLY]），`Packages`、`JavaImporter` 根本不存在，
  * 这类来源的正文一律是空的。**不放宽沙箱**：真把 JDK 类交给脚本，`getClass()`、反射、`Runtime` 的口子就又开了。
- * 改成在这个包里照 JDK 的样子提供**纯计算 / 内存**替身 —— 编码、加密、随机数、大整数及有界压缩流，
+ * 改成在这个包里照 JDK 的样子写几样**纯计算**的替身 —— Base64、Arrays、ArrayList、String、Cipher 和三种密钥 / 参数规格、MessageDigest、Inflater、Thread.sleep，
  * 方法名、参数照 JDK，脚本不用改；真正的 JDK 对象都攥在这些类的私有字段里，不交给脚本。
  * 阅读跑在 Android 上，另有一批来源（连城读书、书耽、柚免费耽美……）导的是 `Packages.android.util`，
  * Base64 用的是 Android 那套 `decode(字节, 2)` / `encodeToString(字节, NO_WRAP)`，也照它做了（[AndroidBase64]）。
  * 替身之外的类（`java.io.File`、`java.lang.Runtime`、`java.lang.System`……）在 `Packages` 里压根没有，
  * 导进来也是 undefined，和从前一样跑不起来。
- * `URL` 仅映射到 JavaBridge 的受控 HTTP 出口，不创建原生连接，来源身份、私网、超时与取消仍由原有管道保护。
  * `org.jsoup`（Jsoup、Connection、TextNode、Parser）也挂在这棵树上，替身本身在 JsoupShim。
  *
  * 只在脚本里出现这几个名字时才装（[COMPAT_TRIGGERS]），装在这一次求值自己的作用域上（[PRELUDE]），不串到别的来源。
  */
 class JdkCompat {
-
-    /** 随机标识与字符集只返回字符串，不把 UUID / Charset 的 JDK 对象交给脚本。 */
-    fun randomUuid(): String = java.util.UUID.randomUUID().toString()
-    fun charsetName(name: String): String = charset(name).name()
-    fun memoryOutput(size: Int): MemoryOutputStreamShim = MemoryOutputStreamShim(size)
-    fun memoryInput(bytes: ByteArray): MemoryInputStreamShim = MemoryInputStreamShim(bytes)
-    fun gzipOutput(target: MemoryOutputStreamShim): GzipOutputStreamShim = GzipOutputStreamShim(target)
-    fun gzipInput(input: MemoryInputStreamShim): MemoryInputStreamShim = gunzip(input)
-    fun memoryReader(input: MemoryInputStreamShim, charset: String): MemoryReaderShim = MemoryReaderShim(input, charset)
-    fun secureRandom(): SecureRandomShim = SecureRandomShim()
-    fun bigInteger(text: String, radix: Int): BigIntegerShim = parseBigInteger(text, radix)
-    fun randomInteger(bits: Int, random: SecureRandomShim): BigIntegerShim = random.randomInteger(bits)
-    fun signedInteger(sign: Int, bytes: ByteArray): BigIntegerShim {
-        require(bytes.size <= 512) { "脚本大整数超过大小限制" }
-        checkMemoryOperation()
-        return BigIntegerShim(java.math.BigInteger(sign, bytes))
-    }
-    fun longInteger(value: Long): BigIntegerShim = BigIntegerShim(java.math.BigInteger.valueOf(value))
 
     /** `java.lang.String(x)` / `String(bytes, charset)`：字节按 UTF-8（或给定编码）解，别的转成字符串 */
     fun string(value: Any?): String = when (value) {
@@ -75,6 +57,25 @@ class JdkCompat {
     fun urlEncode(text: String, charset: String): String = java.net.URLEncoder.encode(text, charset(charset))
 
     fun urlDecode(text: String, charset: String): String = java.net.URLDecoder.decode(text, charset(charset))
+
+    /** 只返回 UUID 文本，来源脚本不能拿到 JDK 对象。 */
+    fun randomUuid(): String = UUID.randomUUID().toString()
+
+    fun bigInteger(text: String, radix: Int): BigIntegerShim = BigIntegerShim.parse(text, radix)
+    fun bigIntegerBytes(bytes: ByteArray): BigIntegerShim = BigIntegerShim.fromBytes(bytes)
+    fun bigIntegerMagnitude(sign: Int, bytes: ByteArray): BigIntegerShim = BigIntegerShim.fromMagnitude(sign, bytes)
+    fun randomBigInteger(bits: Int, random: SecureRandomShim): BigIntegerShim = random.integer(bits)
+    fun secureRandom(): SecureRandomShim = SecureRandomShim()
+
+    fun charsetName(name: String): String = charset(name).name()
+
+    fun memoryOutput(size: Int): MemoryOutputShim = MemoryOutputShim(size)
+
+    fun gzipOutput(target: MemoryOutputShim): GzipOutputShim = GzipOutputShim(target)
+
+    fun gzipInput(input: MemoryInputShim): MemoryInputShim = input.gunzip()
+
+    fun memoryReader(input: MemoryInputShim, charset: String): MemoryLineReader = input.reader(charset)
 
     /**
      * `java.lang.Thread.sleep(毫秒)`：来源在两次请求之间随机停一会儿，免得被站点限流（八叉书库的目录）。
@@ -199,6 +200,29 @@ class JdkCompat {
     copyOfRange: function (a, from, to) { return jdk.copyOfRange(a, from, to); },
     copyOf: function (a, n) { return jdk.copyOf(a, n); }
   });
+  // java.util.ArrayList：来源拿它攒一组结果、整个交回去（星辰小说的书单、蓝海搜书的目录）。
+  // 给的就是一个 JS 数组，列表规则本来就认；再挂上 Java 那几个方法，挂成不可枚举的 —— `for (i in list)` 不会把方法也走一遍。
+  // 从前没有它：`new Packages.java.util.ArrayList()` 是「undefined 不是函数」，整段脚本作废，书单、目录一条都没有
+  function jlist(a) {
+    var m = {
+      add: function (i, x) { if (arguments.length > 1) this.splice(i, 0, x); else this.push(i); return true; },
+      addAll: function (c) { if (c) for (var k = 0; k < c.length; k++) this.push(c[k]); return true; },
+      size: function () { return this.length; },
+      get: function (i) { return this[i]; },
+      set: function (i, x) { var old = this[i]; this[i] = x; return old; },
+      isEmpty: function () { return this.length === 0; },
+      contains: function (x) { return this.indexOf(x) >= 0; },
+      clear: function () { this.length = 0; },
+      toArray: function () { return this.slice(); }
+    };
+    for (var k in m) Object.defineProperty(a, k, { value: m[k], enumerable: false, writable: true });
+    return a;
+  }
+  var AList = cls('ArrayList', function (init) {
+    var a = jlist([]);
+    if (init != null && typeof init !== 'number' && typeof init.length === 'number') a.addAll(init);
+    return a;
+  });
   var Ciph = cls('Cipher', null, {
     getInstance: function (t) { return jdk.cipher(String(t)); },
     ENCRYPT_MODE: 1, DECRYPT_MODE: 2, WRAP_MODE: 3, UNWRAP_MODE: 4
@@ -211,22 +235,8 @@ class JdkCompat {
   var Md = cls('MessageDigest', null, { getInstance: function (alg) { return jdk.messageDigest(String(alg)); } });
   var Infl = cls('Inflater', function (nowrap) { return jdk.inflater(!!nowrap); });
   var Thr = cls('Thread', null, { sleep: function (ms) { jdk.sleep(Number(ms) || 0); } });
-  var Uuid = cls('UUID', null, { randomUUID: function () { return String(jdk.randomUuid()); } });
-  var Charset = cls('Charset', null, { forName: function (n) { return String(jdk.charsetName(String(n))); } });
-  var Bos = cls('ByteArrayOutputStream', function (n) { return jdk.memoryOutput(n == null ? 32 : Number(n)); });
-  var Bis = cls('ByteArrayInputStream', function (b) { return jdk.memoryInput(b); });
-  var Gzos = cls('GZIPOutputStream', function (out) { return jdk.gzipOutput(out); });
-  var Gzis = cls('GZIPInputStream', function (input) { return jdk.gzipInput(input); });
-  var Isr = cls('InputStreamReader', function (input, enc) { return jdk.memoryReader(input, enc == null ? 'UTF-8' : String(enc)); });
-  var Br = cls('BufferedReader', function (reader) { return reader; });
-  var Rng = cls('SecureRandom', function () { return jdk.secureRandom(); });
-  var BigInt = cls('BigInteger', function (a, b) {
-    if (typeof a === 'number') return b != null && typeof b.length === 'number' ? jdk.signedInteger(a, b) : jdk.randomInteger(a, b);
-    return jdk.bigInteger(String(a), b == null ? 10 : Number(b));
-  }, { valueOf: function (n) { return jdk.longInteger(n); }, ONE: jdk.longInteger(1), ZERO: jdk.longInteger(0) });
   var UrlEnc = cls('URLEncoder', null, { encode: function (s, enc) { return jdk.urlEncode(str(s), enc == null ? 'UTF-8' : String(enc)); } });
   var UrlDec = cls('URLDecoder', null, { decode: function (s, enc) { return jdk.urlDecode(str(s), enc == null ? 'UTF-8' : String(enc)); } });
-  var Url = cls('URL', function (url) { return top.java.guardedUrl(String(url)); });
   // org.jsoup：Parser 只是个记号，parse 认出 xmlParser 就按 XML 解析
   function str(v) { return v == null ? '' : String(v); }
   function isParser(p) { return !!(p && p.__inkwellParser); }
@@ -247,12 +257,38 @@ class JdkCompat {
   });
   var TxtNode = cls('TextNode', function (t) { return jdk.jsoupTextNode(str(t)); });
   var Elem = cls('Element', function (tag) { return jdk.jsoupElement(String(tag)); });
+  var Uuid = cls('UUID', null, { randomUUID: function () { return String(jdk.randomUuid()); } });
+  var Random = cls('SecureRandom', function () { return jdk.secureRandom(); });
+  var BigInt = cls('BigInteger', function (value, arg) {
+    if (typeof value === 'string') return jdk.bigInteger(value, arguments.length > 1 ? Number(arg) : 10);
+    if (arguments.length > 1) return arg != null && typeof arg.length === 'number'
+      ? jdk.bigIntegerMagnitude(Number(value), arg) : jdk.randomBigInteger(Number(value), arg);
+    return jdk.bigIntegerBytes(value);
+  }, { valueOf: function (value) {
+    if (!Number.isSafeInteger(value)) throw new RangeError('大整数超出 JavaScript 安全整数范围，请使用字符串构造');
+    return jdk.bigInteger(String(value), 10);
+  } });
+  Object.defineProperties(BigInt, {
+    ZERO: { get: function () { return jdk.bigInteger('0', 10); } },
+    ONE: { get: function () { return jdk.bigInteger('1', 10); } },
+    TEN: { get: function () { return jdk.bigInteger('10', 10); } }
+  });
+  var Charset = cls('Charset', null, { forName: function (name) { return String(jdk.charsetName(String(name))); } });
+  var MemOut = cls('ByteArrayOutputStream', function (size) { return jdk.memoryOutput(size == null ? 32 : Number(size)); });
+  var GzipOut = cls('GZIPOutputStream', function (out) { return jdk.gzipOutput(out); });
+  var GzipIn = cls('GZIPInputStream', function (input) { return jdk.gzipInput(input); });
+  var InputReader = cls('InputStreamReader', function (input, encoding) { return jdk.memoryReader(input, encoding == null ? 'UTF-8' : String(encoding)); });
+  var BufferedReader = cls('BufferedReader', function (reader) { return reader; });
+  var Url = cls('URL', function (address) { return top.java.guardedUrl(String(address)); });
+  var TextUtils = cls('TextUtils', null, { isEmpty: function (value) { return value == null || String(value).length === 0; } });
   var pkgs = {
-    java: { lang: { String: Str, Thread: Thr }, util: { UUID: Uuid, Base64: B64, Arrays: Arr, zip: { Inflater: Infl, GZIPOutputStream: Gzos, GZIPInputStream: Gzis } }, security: { MessageDigest: Md, SecureRandom: Rng }, math: { BigInteger: BigInt },
-      io: { ByteArrayOutputStream: Bos, ByteArrayInputStream: Bis, InputStreamReader: Isr, BufferedReader: Br }, nio: { charset: { Charset: Charset } },
-      net: { URL: Url, URLEncoder: UrlEnc, URLDecoder: UrlDec } },
+    java: { lang: { String: Str, Thread: Thr }, util: { Base64: B64, Arrays: Arr, ArrayList: AList, UUID: Uuid,
+      zip: { Inflater: Infl, GZIPOutputStream: GzipOut, GZIPInputStream: GzipIn } },
+      math: { BigInteger: BigInt }, security: { MessageDigest: Md, SecureRandom: Random }, net: { URLEncoder: UrlEnc, URLDecoder: UrlDec, URL: Url },
+      io: { ByteArrayOutputStream: MemOut, InputStreamReader: InputReader, BufferedReader: BufferedReader },
+      nio: { charset: { Charset: Charset } } },
     javax: { crypto: { Cipher: Ciph, spec: { SecretKeySpec: Key, IvParameterSpec: Iv, GCMParameterSpec: Gcm } } },
-    android: { util: { Base64: B64 } },
+    android: { util: { Base64: B64 }, text: { TextUtils: TextUtils } },
     org: { jsoup: { Jsoup: Jsp, Connection: Conn, nodes: { TextNode: TxtNode, Element: Elem }, parser: { Parser: Prs } } }
   };
   function importInto(target, what) {

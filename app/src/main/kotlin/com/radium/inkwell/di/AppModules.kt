@@ -18,6 +18,7 @@ import com.radium.inkwell.data.repo.SourceReadHealth
 import com.radium.inkwell.data.repo.NetBookRepository
 import com.radium.inkwell.data.repo.ReplaceRuleRepository
 import com.radium.inkwell.data.repo.WebDavRepository
+import com.radium.inkwell.data.source.SourceLoginSessions
 import com.radium.inkwell.ui.bookshelf.BookshelfViewModel
 import com.radium.inkwell.ui.reader.ReaderViewModel
 import com.radium.inkwell.ui.search.SearchViewModel
@@ -46,7 +47,12 @@ val appModule = module {
     single { get<InkwellDb>().rssSourceDao() }
     single { get<InkwellDb>().readingStatDao() }
     single { get<InkwellDb>().rssArticleDao() }
-    single { com.radium.inkwell.data.repo.ReadingStatsRepository(get(), get(), get()) }
+    single {
+        val context = androidContext()
+        com.radium.inkwell.data.repo.ReadingStatsRepository(get(), get(), get()) {
+            com.radium.inkwell.ui.stats.ReadingWidgetProvider.refresh(context)
+        }
+    }
 
     // EPUB/MOBI 的 sniff 靠魔数，txt 兜底放最后
     // txt 的解码结果与拆章表缓存在系统可清理的缓存目录：没了只是下次打开慢一次（见 TxtParser / TxtCache）
@@ -66,8 +72,14 @@ val appModule = module {
     single { ChapterContentCache(java.io.File(androidContext().filesDir, "cache")) }
 
     // 抓取日志接到 logcat：成功 debug、失败/重试 warn。开发者模式的运行日志录的就是 logcat
+    single { SourceLoginSessions(androidContext()) }
     single {
+        val sessions = get<SourceLoginSessions>()
         SourceHttpClient(
+            webCookies = sessions::webCookies,
+            updateWebCookies = sessions::updateWebCookies,
+            clearWebCookies = sessions::clearWebCookies,
+            sessionStore = sessions,
             logger = { warn, msg, e ->
                 if (warn) android.util.Log.w("SourceHttp", msg, e) else android.util.Log.d("SourceHttp", msg)
             },
@@ -83,7 +95,7 @@ val appModule = module {
     }
     // JS 渲染回退：静态 HTML 解析不出内容时用 WebView 执行页面 JS 再试（详情/目录/正文三级）
     single<com.radium.inkwell.core.source.PageRenderer> {
-        com.radium.inkwell.data.source.WebViewPageRenderer(androidContext())
+        com.radium.inkwell.data.source.WebViewPageRenderer(androidContext(), sessions = get())
     }
     single {
         val replaceRules = get<ReplaceRuleRepository>()
@@ -92,7 +104,7 @@ val appModule = module {
             scriptRuntime = get(),
             renderer = get(),
             globalPurify = { source, bookTitle -> replaceRules.purifyFor(source, bookTitle) },
-            sessions = get<com.radium.inkwell.sourceauth.PersistentSourceSessions>(),
+            sessionStore = get<SourceLoginSessions>(),
         )
     }
     single { com.radium.inkwell.core.source.rss.RssEngine(http = get(), scriptRuntime = get(), renderer = get()) }
@@ -129,7 +141,10 @@ val appModule = module {
             com.radium.inkwell.update.InstalledAppAuthenticity(androidContext()),
         )
     }
-    single { com.radium.inkwell.update.UpdateManager(get(), get(), get()) }
+    single {
+        val prefs = get<com.radium.inkwell.data.prefs.AppPrefs>()
+        com.radium.inkwell.update.UpdateManager(get(), get(), get(), prefs::githubRetryAt, prefs::recordGithubRateLimit)
+    }
     // 启动时查更新、书架齿轮与设置页的红点读它（见 UpdateNotifier）
     single { com.radium.inkwell.update.UpdateNotifier(androidContext(), get(), get()) }
 
@@ -143,35 +158,28 @@ val appModule = module {
     single { AutoSourceSwitcher(get(), get()) }
     single { com.radium.inkwell.util.LocalNetworkAccess(androidContext()) }
     single { WebDavRepository(get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
+    single { com.radium.inkwell.data.repo.LocalBookBackupRepository(get(), get(), get()) }
     single { com.radium.inkwell.data.net.OfficialWebDavClient(get()) }
     single { com.radium.inkwell.data.repo.OfficialWebDavRepository(get(), get()) }
 
     viewModel { BookshelfViewModel(get(), get(), get(), get(), get(), get(), get(), get()) }
     viewModel { (bookId: String) ->
-        ReaderViewModel(bookId, get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get())
+        ReaderViewModel(bookId, get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get())
     }
     viewModel { SearchViewModel(get(), get(), get(), get()) }
     viewModel { (results: List<com.radium.inkwell.core.source.SearchResult>) ->
         com.radium.inkwell.ui.preview.BookPreviewViewModel(results, get(), get(), get())
     }
     viewModel { com.radium.inkwell.ui.explore.ExploreViewModel(get(), get(), get(), get()) }
-    viewModel { (bookId: String) -> com.radium.inkwell.ui.detail.BookDetailViewModel(bookId, get(), get(), get(), get(), get()) }
+    viewModel { (bookId: String) -> com.radium.inkwell.ui.detail.BookDetailViewModel(bookId, get(), get(), get(), get(), get(), get()) }
     // 校验挂在应用级单例上，离开书源管理页也照跑（见 SourceChecker）
     single { com.radium.inkwell.ui.sourcemanage.SourceChecker(get(), get(), get()) }
     // 整本缓存同理：离开详情页照常跑
     single { com.radium.inkwell.data.repo.OfflineDownloader(get(), get(), get(), get(), get()) }
-    viewModel { SourceManageViewModel(androidContext(), get(), get(), get()) }
-    viewModel { (sourceId: String) -> SourceDetailViewModel(sourceId, get(), get(), get(), get()) }
-    single {
-        com.radium.inkwell.sourceauth.EncryptedSessionStore(
-            java.io.File(androidContext().noBackupFilesDir, "source-auth"),
-            com.radium.inkwell.sourceauth.KeystoreSessionCipher(),
-        )
-    }
-    single { com.radium.inkwell.sourceauth.PersistentSourceSessions(get()) }
-    viewModel { (sourceId: String) -> com.radium.inkwell.ui.sourceauth.SourceLoginViewModel(sourceId, get(), get(), get(), get()) }
+    viewModel { SourceManageViewModel(androidContext(), get(), get(), get(), get()) }
+    viewModel { (sourceId: String) -> SourceDetailViewModel(sourceId, get(), get(), get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.sourcewizard.SourceWizardViewModel(get(), get(), get(), get()) }
-    viewModel { WebDavViewModel(get(), get(), get(), get()) }
+    viewModel { WebDavViewModel(get(), get(), get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.feedback.FeedbackViewModel(androidContext(), get(), get(), get()) }
     viewModel { com.radium.inkwell.ui.settings.DeveloperViewModel(get(), get()) }
     viewModel { com.radium.inkwell.ui.stats.ReadingStatsViewModel(get(), get()) }

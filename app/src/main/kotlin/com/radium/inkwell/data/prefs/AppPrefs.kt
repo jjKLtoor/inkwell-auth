@@ -25,12 +25,28 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import java.io.IOException
+
+private const val FEEDBACK_RECEIPT_LIMIT = 30
+
+internal data class SearchPriorityPreferences(
+    val enabled: Boolean = true,
+    val sourceIds: Set<String> = emptySet(),
+    val bookIds: Set<String> = emptySet(),
+)
 
 private val Context.appDataStore by preferencesDataStore(
     name = "app_prefs",
@@ -42,6 +58,8 @@ private val Context.appDataStore by preferencesDataStore(
 class AppPrefs(private val context: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val feedbackReplyCipher = KeystoreSecretCipher("inkwell_feedback_reply_v1")
+    private val temporaryFeedbackReceipts = MutableStateFlow(emptyList<FeedbackReceipt>())
 
     internal object Keys {
         val UPDATE_CHANNEL = stringPreferencesKey("update_channel")
@@ -69,10 +87,12 @@ class AppPrefs(private val context: Context) {
         val BOOKSHELF_COLUMNS = intPreferencesKey("bookshelf_columns")
         val HIDDEN_REQUIRE_AUTH = booleanPreferencesKey("hidden_require_auth")
         val SEARCH_HISTORY_ENABLED = booleanPreferencesKey("search_history_enabled")
-        val SOURCE_SEARCH_HIGH = stringSetPreferencesKey("source_search_high")
-        val SOURCE_SEARCH_HIGHEST = stringSetPreferencesKey("source_search_highest")
+        val SEARCH_PRIORITIES_ENABLED = booleanPreferencesKey("search_priorities_enabled")
+        val PRIORITIZED_SOURCES = stringSetPreferencesKey("prioritized_sources")
+        val PRIORITIZED_BOOKS = stringSetPreferencesKey("prioritized_books")
         /** 搜索历史，新的在前，换行分隔（关键词入库前已把换行压成空格，见 [pushSearchHistory]） */
         val SEARCH_HISTORY = stringPreferencesKey("search_history")
+        val FEEDBACK_RECEIPTS = stringPreferencesKey("feedback_receipts")
         /** 发现页选择器「最近」用过的书源 id，新的在前，换行分隔（id 是单行的网址，不会自带换行） */
         val RECENT_EXPLORE_SOURCES = stringPreferencesKey("recent_explore_sources")
         /**
@@ -97,6 +117,7 @@ class AppPrefs(private val context: Context) {
         val UPDATE_KNOWN_LATEST = stringPreferencesKey("update_known_latest")
         val UPDATE_KNOWN_FOR = stringPreferencesKey("update_known_for")
         val UPDATE_SEEN = stringPreferencesKey("update_seen_version")
+        val GITHUB_RETRY_AT = longPreferencesKey("github_update_retry_at")
         val UPDATE_CHECKED_AT = longPreferencesKey("update_checked_at")
         /** 最后一次改动的时间戳；WebDAV 整块 LWW 靠它裁决 */
         val UPDATED_AT = longPreferencesKey("settings_updated_at")
@@ -352,12 +373,83 @@ class AppPrefs(private val context: Context) {
         }
     }
 
+    private val storedFeedbackReceipts = context.appDataStore.data
+        .map { it[Keys.FEEDBACK_RECEIPTS] }
+        .distinctUntilChanged()
+        .map(::decodeFeedbackReceipts)
+        .catch { error ->
+            if (error is IOException) emit(emptyList()) else throw error
+        }
+
+    val feedbackReceipts = storedFeedbackReceipts.combine(temporaryFeedbackReceipts) { stored, temporary ->
+        (temporary + stored).distinctBy { it.url }.take(FEEDBACK_RECEIPT_LIMIT).map { it.copy(replyToken = null) }
+    }
+
+    fun feedbackReceipt(issue: Int, url: String): Flow<FeedbackReceipt?> = storedFeedbackReceipts
+        .map { receipts -> receipts.firstOrNull { it.issue == issue && it.url == url } }
+        .distinctUntilChanged()
+        .combine(temporaryFeedbackReceipts) { stored, temporary ->
+            temporary.firstOrNull { it.issue == issue && it.url == url }
+                ?: stored?.copy(replyToken = stored.replyToken?.let(feedbackReplyCipher::decrypt))
+        }
+        .flowOn(Dispatchers.IO)
+
+    suspend fun addFeedbackReceipt(receipt: FeedbackReceipt): Boolean = withContext(Dispatchers.IO) {
+        val encryptedToken = receipt.replyToken?.let { runCatching { feedbackReplyCipher.encrypt(it) }.getOrNull() }
+        val stored = receipt.copy(replyToken = encryptedToken)
+        var saved = false
+        try {
+            context.appDataStore.edit { p ->
+                val previous = decodeFeedbackReceipts(p[Keys.FEEDBACK_RECEIPTS])
+                p[Keys.FEEDBACK_RECEIPTS] = Json.encodeToString(
+                    (listOf(stored) + previous.filterNot { it.url == stored.url }).take(FEEDBACK_RECEIPT_LIMIT),
+                )
+            }
+            saved = receipt.replyToken == null || encryptedToken != null
+            saved
+        } finally {
+            // 保存失败时，已提交的记录仍可在本次应用进程中打开和回复。
+            temporaryFeedbackReceipts.update { receipts ->
+                val others = receipts.filterNot { it.url == receipt.url }
+                if (saved) others else (listOf(receipt) + others).take(FEEDBACK_RECEIPT_LIMIT)
+            }
+        }
+    }
+
     /**
      * 是否记录搜索历史。默认开。
      *
      * 开关进备份、随设备同步；**历史本身不进备份**：搜过什么是这台设备上的事，
      * 同步过去等于把别人在另一台设备上搜的词摊在这台的搜索页上。
      */
+    /** 本机标签只存 ID，规则内容、书架行及备份格式不用改。 */
+    internal val searchPriorities: Flow<SearchPriorityPreferences> = context.appDataStore.data
+        .map { prefs ->
+            SearchPriorityPreferences(
+                enabled = prefs[Keys.SEARCH_PRIORITIES_ENABLED] ?: true,
+                sourceIds = prefs[Keys.PRIORITIZED_SOURCES].orEmpty(),
+                bookIds = prefs[Keys.PRIORITIZED_BOOKS].orEmpty(),
+            )
+        }
+        .catch { if (it is IOException) emit(SearchPriorityPreferences()) else throw it }
+        .distinctUntilChanged()
+
+    suspend fun setSearchPrioritiesEnabled(enabled: Boolean) {
+        context.appDataStore.edit { it[Keys.SEARCH_PRIORITIES_ENABLED] = enabled }
+    }
+
+    suspend fun setSourceSearchPriority(id: String, on: Boolean) = setSearchPriority(Keys.PRIORITIZED_SOURCES, id, on)
+
+    suspend fun setBookSearchPriority(id: String, on: Boolean) = setSearchPriority(Keys.PRIORITIZED_BOOKS, id, on)
+
+    private suspend fun setSearchPriority(key: Preferences.Key<Set<String>>, id: String, on: Boolean) {
+        context.appDataStore.edit { prefs ->
+            val ids = prefs[key].orEmpty()
+            val updated = if (on) ids + id else ids - id
+            if (updated.isEmpty()) prefs.remove(key) else prefs[key] = updated
+        }
+    }
+
     val searchHistoryEnabled: Flow<Boolean> = context.appDataStore.data.map { p ->
         p[Keys.SEARCH_HISTORY_ENABLED] ?: true
     }.distinctUntilChanged()
@@ -543,6 +635,12 @@ class AppPrefs(private val context: Context) {
         )
     }.distinctUntilChanged()
 
+    suspend fun githubRetryAt(): Long = context.appDataStore.data.first()[Keys.GITHUB_RETRY_AT] ?: 0L
+
+    suspend fun recordGithubRateLimit(until: Long) {
+        context.appDataStore.edit { it[Keys.GITHUB_RETRY_AT] = until }
+    }
+
     /** 记下一次查成的结果：[latest] 为 null = 已是最新。查失败不调它（上次查到的照旧算数） */
     suspend fun recordUpdateCheck(latest: String?, checkedFor: String, at: Long) {
         context.appDataStore.edit { p ->
@@ -600,30 +698,6 @@ class AppPrefs(private val context: Context) {
     val duplicateHintEnabledState: StateFlow<Boolean?> = duplicateHintEnabled.warm()
     val autoCheckUpdateState: StateFlow<Boolean?> = autoCheckUpdate.warm()
     val searchHistoryEnabledState: StateFlow<Boolean?> = searchHistoryEnabled.warm()
-
-    /** 本机的调度偏好。按来源 ID 保存，导入新版规则时沿用，普通规则文件不包含此设置。 */
-    val sourceSearchPriorities: Flow<Map<String, SourceSearchPriority>> = context.appDataStore.data.map { prefs ->
-        buildMap {
-            prefs[Keys.SOURCE_SEARCH_HIGH].orEmpty().forEach { put(it, SourceSearchPriority.HIGH) }
-            prefs[Keys.SOURCE_SEARCH_HIGHEST].orEmpty().forEach { put(it, SourceSearchPriority.HIGHEST) }
-        }
-    }.distinctUntilChanged()
-
-    suspend fun readSourceSearchPriorities(): Map<String, SourceSearchPriority> = try {
-        sourceSearchPriorities.first()
-    } catch (_: java.io.IOException) {
-        emptyMap()
-    }
-
-    suspend fun setSourceSearchPriority(id: String, priority: SourceSearchPriority) {
-        context.appDataStore.edit { prefs ->
-            for ((level, key) in listOf(SourceSearchPriority.HIGH to Keys.SOURCE_SEARCH_HIGH, SourceSearchPriority.HIGHEST to Keys.SOURCE_SEARCH_HIGHEST)) {
-                val ids = prefs[key].orEmpty()
-                val next = if (priority == level) ids + id else ids - id
-                if (next.isEmpty()) prefs.remove(key) else prefs[key] = next
-            }
-        }
-    }
     val bookshelfLayoutState: StateFlow<BookshelfLayout?> = bookshelfLayout.warm()
     val bookshelfColumnsState: StateFlow<Int?> = bookshelfColumns.warm()
     val cacheAutoPruneDaysState: StateFlow<Int?> = cacheAutoPruneDays.warm()
@@ -650,9 +724,9 @@ class AppPrefs(private val context: Context) {
     }
 }
 
-enum class SourceSearchPriority(val label: String) {
-    DEFAULT("默认"), HIGH("优先"), HIGHEST("最高"),
-}
+private fun decodeFeedbackReceipts(raw: String?): List<FeedbackReceipt> = raw?.let {
+    runCatching { Json.decodeFromString<List<FeedbackReceipt>>(it) }.getOrNull()
+}.orEmpty()
 
 private fun decodeSearchHistory(raw: String?): List<String> =
     raw?.split('\n')?.filter { it.isNotBlank() }.orEmpty()

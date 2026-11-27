@@ -114,9 +114,6 @@ data object SourceManageRoute : NavKey
 @Serializable
 data class SourceDetailRoute(val sourceId: String) : NavKey
 
-@Serializable
-data class SourceLoginRoute(val sourceId: String) : NavKey
-
 /** 新建书源：给一本书的网址，认出目录与正文，存成书源（见 SourceWizardViewModel） */
 @Serializable
 data object SourceWizardRoute : NavKey
@@ -144,6 +141,12 @@ data object WebDavSettingsRoute : NavKey
 
 @Serializable
 data object FeedbackRoute : NavKey
+
+@Serializable
+data object FeedbackHistoryRoute : NavKey
+
+@Serializable
+data class FeedbackDiscussionRoute(val issue: Int, val url: String, val title: String) : NavKey
 
 @Serializable
 data object DisclaimerRoute : NavKey
@@ -176,6 +179,8 @@ internal fun NavKey?.diagnosticName(): String = when (this) {
     is ThemeSettingsRoute -> "theme_settings"
     is WebDavSettingsRoute -> "webdav"
     is FeedbackRoute -> "feedback"
+    is FeedbackHistoryRoute -> "feedback_history"
+    is FeedbackDiscussionRoute -> "feedback_discussion"
     is DisclaimerRoute -> "disclaimer"
     is DeveloperSettingsRoute -> "developer_settings"
     null -> "none"

@@ -1,11 +1,15 @@
 package com.radium.inkwell.ui.sourcemanage
 
 import android.content.Context
+import com.radium.inkwell.data.prefs.AppPrefs
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.radium.inkwell.data.db.entity.BookSourceListItem
 import com.radium.inkwell.data.db.entity.CheckStatus
+import com.radium.inkwell.util.MAX_SOURCE_IMPORT_BYTES
+import com.radium.inkwell.util.readImportText
 import kotlinx.coroutines.flow.mapLatest
 import com.radium.inkwell.data.repo.BookSourceRepository
 import com.radium.inkwell.ui.components.MessageBus
@@ -52,7 +56,7 @@ data class CheckProgress(
  * 关掉它能快好几倍。关键词也得可改 —— 生僻词会把好书源误判成「搜索无结果」。
  */
 data class CheckOptions(
-    val keyword: String = "",
+    val keyword: String = "我的",
     val timeoutMs: Long = 60_000,
     val checkDetail: Boolean = true,
     val checkToc: Boolean = true,
@@ -66,6 +70,7 @@ enum class SourceFilter(val label: String) {
     FAILED("失效"),
     UNCHECKED("未校验"),
     EXPLORE_ONLY("仅发现页"),
+    PRIORITIZED("优先搜索"),
 }
 
 enum class SourceSort(val label: String) {
@@ -98,7 +103,10 @@ class SourceManageViewModel(
     private val checker: SourceChecker,
     /** 「从网址导入书源」用；走注入的那个客户端，它配了超时（裸 OkHttpClient() 没有总闸） */
     private val http: OkHttpClient,
+    appPrefs: AppPrefs,
 ) : ViewModel() {
+
+    private val searchPriorities = appPrefs.searchPriorities
 
     // ---- 多选 ----
 
@@ -331,7 +339,7 @@ class SourceManageViewModel(
         kotlinx.coroutines.flow.combine(
             sources,
             _query.debounce { if (it.isEmpty()) 0L else QUERY_DEBOUNCE_MS },
-            _filter, _sort, _group, searchless,
+            _filter, _sort, _group, searchless, searchPriorities,
         ) { args ->
             @Suppress("UNCHECKED_CAST")
             val list = args[0] as List<BookSourceListItem>
@@ -340,9 +348,10 @@ class SourceManageViewModel(
             val o = args[3] as SourceSort
             val g = args[4] as String?
             val exploreOnly = (args[5] as BookSourceRepository.SearchlessIds).exploreOnly
+            val priorities = (args[6] as SearchPriorityPreferences).sourceIds
             list.asSequence()
                 .filter { matchesQuery(it, q) }
-                .filter { matchesFilter(it, f, exploreOnly) }
+                .filter { matchesFilter(it, f, exploreOnly, priorities) }
                 .filter { g == null || g in splitGroups(it.groupName) }
                 .sortedWith(sourceComparator(o))
                 .toList()
@@ -367,13 +376,14 @@ class SourceManageViewModel(
         return s.name.contains(k, true) || s.id.contains(k, true) || s.groupName.contains(k, true)
     }
 
-    private fun matchesFilter(s: BookSourceListItem, f: SourceFilter, exploreOnly: Set<String>): Boolean = when (f) {
+    private fun matchesFilter(s: BookSourceListItem, f: SourceFilter, exploreOnly: Set<String>, priorities: Set<String>): Boolean = when (f) {
         SourceFilter.ALL -> true
         SourceFilter.ENABLED -> s.enabled
         SourceFilter.DISABLED -> !s.enabled
         SourceFilter.FAILED -> s.checkStatus == CheckStatus.FAILED
         SourceFilter.UNCHECKED -> s.checkStatus == CheckStatus.UNCHECKED
         SourceFilter.EXPLORE_ONLY -> s.id in exploreOnly
+        SourceFilter.PRIORITIZED -> s.id in priorities
     }
 
     val failedCount: StateFlow<Int> = sources
@@ -417,7 +427,7 @@ class SourceManageViewModel(
             val text = withContext(Dispatchers.IO) {
                 runCatching {
                     context.contentResolver.openInputStream(uri)?.use {
-                        it.readBytes().toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                        it.readImportText(MAX_SOURCE_IMPORT_BYTES)
                     } ?: error("无法读取文件")
                 }
             }
@@ -442,8 +452,8 @@ class SourceManageViewModel(
                             // 先预读（request 只往缓冲里填、不消费）确认没超，再交给 body.string() ——
                             // BOM 与 Content-Type 里的字符集它都会处理，自己按 UTF-8 解的话带 BOM 的合集就解析不了
                             val body = resp.body
-                            check(!body.source().request(MAX_IMPORT_BYTES + 1L)) {
-                                "文件太大（超过 ${MAX_IMPORT_BYTES shr 20}MB）"
+                            check(!body.source().request(MAX_SOURCE_IMPORT_BYTES + 1L)) {
+                                "文件太大（超过 ${MAX_SOURCE_IMPORT_BYTES shr 20}MB）"
                             }
                             body.string()
                         }
@@ -465,7 +475,7 @@ class SourceManageViewModel(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            messages.emit("无法读取书源：${e.message?.take(120) ?: "格式无效"}")
+            messages.emit("无法读取来源：${e.message?.take(120) ?: "格式无效"}")
         }
     }
 
@@ -504,8 +514,6 @@ class SourceManageViewModel(
     }
 
     private companion object {
-        /** 从网址导入书源的大小上限 */
-        const val MAX_IMPORT_BYTES = 32 shl 20
         /** 搜索框停手多久才重新过滤：几千个源每个字都全量过滤一遍，打字会跟不上 */
         const val QUERY_DEBOUNCE_MS = 150L
     }

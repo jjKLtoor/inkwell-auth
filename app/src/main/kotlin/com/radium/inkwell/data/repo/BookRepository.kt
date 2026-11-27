@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.UUID
 
@@ -39,6 +41,9 @@ class BookRepository(
 
     // 前台选文件与目录自动扫描可能同时导入，元数据去重与插入必须串行。
     private val localImportMutex = Mutex()
+    private val seriesFiles = LocalSeriesFiles(context.filesDir, context.cacheDir)
+
+    suspend fun migrateSeriesManifests() = withContext(Dispatchers.IO) { seriesFiles.migrateLegacy() }
 
     val books: Flow<List<BookEntity>> = bookDao.observeAll()
 
@@ -60,7 +65,7 @@ class BookRepository(
      * 合并靠 (书名,作者) —— 判断"已在书架"、以及直达已存在的那本，都得按这个键，否则换个
      * 代表书源就认不出是同一本，于是要么重复显示"加入"、要么再入库一份重复的。
      *
-     * **必须排除墓碑和试读未上架**（getAllVisible 而非 getAll）：删过的书行还在库里，若把它也
+     * **必须排除墓碑和试读未上架**：删过的书行还在库里，若把它也
      * 认成"已在书架"，预览页会显示「已在书架」而书架上根本没有 —— 加不进去（被这里挡住）、
      * 点"读"打开的是那条墓碑（读得了但永远不回书架）。试读行同样不在架上，不能当成已加入。
      *
@@ -70,9 +75,7 @@ class BookRepository(
      */
     suspend fun shelfBookIdByKey(title: String, author: String?, includeHidden: Boolean = true): String? {
         val key = bookKey(title, author)
-        return bookDao.getAllVisible().firstOrNull {
-            (includeHidden || !it.hidden) && bookKey(it.title, it.author) == key
-        }?.id
+        return bookDao.findShelfBookId(key.first, key.second, includeHidden, BOOK_KEY_WHITESPACE)
     }
 
     /**
@@ -91,6 +94,7 @@ class BookRepository(
     private suspend fun shelfLocalBookByKey(title: String, author: String?, includeRemoved: Boolean = false): BookEntity? {
         val key = bookKey(title, author)
         val matches = bookDao.findLocalBooks(key.first, key.second, includeRemoved, BOOK_KEY_WHITESPACE)
+            .filter { it.type != BookType.LOCAL_SERIES }
         return matches.firstOrNull { it.inShelf && it.hasLocalFile() }
             ?: matches.firstOrNull { it.inShelf }
             ?: matches.firstOrNull { it.hasLocalFile() } ?: matches.firstOrNull()
@@ -98,6 +102,11 @@ class BookRepository(
 
     /** 本机有这本书的文件。WebDAV 同步来的本地书只有书行（文件不进备份），localPath 为 null */
     private fun BookEntity.hasLocalFile(): Boolean = localPath?.let { File(it).isFile } == true
+
+    suspend fun needsLocalFile(book: BookEntity): Boolean =
+        withContext(Dispatchers.IO) {
+            book.type != BookType.NET && book.type != BookType.LOCAL_SERIES && !book.hasLocalFile()
+        }
 
     private fun booksDir(): File = File(context.filesDir, "books").apply { mkdirs() }
 
@@ -195,12 +204,60 @@ class BookRepository(
         chapterDao.deleteByBook(bookId)
     }
 
+    internal suspend fun restoreLocalBook(
+        bookId: String,
+        extension: String,
+        receive: suspend (File) -> Unit,
+    ): Unit = restoreLocalFile(bookId, extension, originalName = null, receive)
+
+    suspend fun recoverLocalBook(bookId: String, uri: Uri) {
+        val name = externalBookDisplayName(uri, mimeType = null)
+        val extension = name.substringAfterLast('.').lowercase()
+        restoreLocalFile(bookId, extension, originalName = name) { part ->
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                part.outputStream().use { output -> input.copyTo(output) }
+            } ?: error("无法读取所选原文件")
+        }
+    }
+
+    private suspend fun restoreLocalFile(
+        bookId: String,
+        extension: String,
+        originalName: String?,
+        receive: suspend (File) -> Unit,
+    ): Unit = withContext(Dispatchers.IO) {
+        val fileId = UUID.randomUUID().toString()
+        val dest = File(booksDir(), "$fileId.$extension")
+        // 先下进缓存目录、下完校验过了再挪进 books/：下到一半进程被杀，回滚那段根本轮不到跑，
+        // 直接下进 books/ 的话就留下半截文件，库里没有它、也没人删。缓存目录里的残留系统会清
+        val part = File.createTempFile("restore", ".part", context.cacheDir)
+        try {
+            receive(part)
+            check(part.renameTo(dest)) { "无法写入书籍文件" }
+            localImportMutex.withLock {
+                insertCopiedLocal(dest, originalName ?: dest.name, fileId, extension, restoreId = bookId, verifyMetadata = originalName != null)
+            }
+        } catch (e: Exception) {
+            withContext(NonCancellable) {
+                part.delete()
+                if (bookDao.countByLocalPath(dest.absolutePath) == 0) {
+                    parserRegistry.evictCaches(dest)
+                    dest.delete()
+                    File(coversDir(), "$fileId.img").delete()
+                }
+            }
+            throw e
+        }
+    }
+
     private suspend fun insertCopiedLocal(
         dest: File,
         displayName: String,
         bookId: String,
         ext: String,
-        initialGroup: String?,
+        initialGroup: String? = null,
+        restoreId: String? = null,
+        verifyMetadata: Boolean = false,
     ): LocalImportResult {
         val handle = parserRegistry.open(dest)
         return handle.use { book ->
@@ -212,19 +269,48 @@ class BookRepository(
                 f.absolutePath
             }
             val now = System.currentTimeMillis()
-            val type = when (ext) {
-                "epub" -> BookType.LOCAL_EPUB
-                "mobi", "azw3", "azw" -> BookType.LOCAL_MOBI
-                else -> BookType.LOCAL_TXT
-            }
+            val type = localBookTypeForExtension(ext) ?: BookType.LOCAL_TXT
             val fallbackTitle = displayName.substringBeforeLast('.').trim()
             val title = if (type == BookType.LOCAL_TXT) {
                 fallbackTitle
             } else {
-                book.metadata.title.takeIf { it.isNotBlank() && it != "未命名" }
-                    ?: fallbackTitle
+                book.metadata.title.takeIf { it.isNotBlank() && it != "未命名" } ?: fallbackTitle
             }.ifBlank { "未命名" }
-            val author = book.metadata.author ?: ""
+            val author = book.metadata.author.orEmpty()
+            if (restoreId != null) {
+                val hash = dest.sha256()
+                val chapters = book.chapters.map { ChapterEntity(restoreId, it.index, it.title) }
+                db.withWriteTransaction {
+                    val existing = bookDao.getById(restoreId)
+                    if (existing?.hidden == true && !verifyMetadata) throw HiddenBookFileException()
+                    val eligible = if (verifyMetadata) existing?.isLocalOriginal() == true else existing?.canBackUpFile() == true
+                    check(existing != null && eligible && existing.type == type) {
+                        "书架条目已变更，请同步书架后重试"
+                    }
+                    check(!existing.hasLocalFile()) { "本机已有原文件" }
+                    val expectedHash = existing.localFileHash
+                    // 云端文件已按用户选中的备份版本校验；手动补原文件才与书架记录比对。
+                    if (verifyMetadata && expectedHash != null) {
+                        check(hash == expectedHash) { "文件内容与原书不同，请选择原文件" }
+                    } else if (verifyMetadata) {
+                        val previousChapters = chapterDao.getByBook(restoreId)
+                        check(
+                            bookKey(title, author) == bookKey(existing.title, existing.author) &&
+                                (existing.totalChapters == 0 || existing.totalChapters == chapters.size) &&
+                                (previousChapters.isEmpty() || previousChapters.map { it.title } == chapters.map { it.title }),
+                        ) { "书名、作者或目录与原书不同，请检查所选文件" }
+                    }
+                    bookDao.update(existing.copy(
+                        localPath = dest.absolutePath,
+                        localFileHash = hash,
+                        coverPath = coverPath,
+                        totalChapters = chapters.size,
+                    ))
+                    chapterDao.deleteByBook(restoreId)
+                    chapterDao.upsertAll(chapters)
+                }
+                return@use LocalImportResult.Added(restoreId)
+            }
 
             shelfLocalBookByKey(title, author, includeRemoved = true)?.let { existing ->
                 if (existing.hasLocalFile()) {
@@ -241,6 +327,8 @@ class BookRepository(
                 // 还把刚复制来的文件删了，用户怎么导都打不开，只能删掉那条坏书；而删除会同步回去，
                 // 把原设备上的真书文件也一并删掉。补上文件、沿用原 id（进度/分组/隐藏都跟着这条书行走）。
                 val fresh = bookDao.getById(existing.id) ?: existing
+                val hash = dest.sha256()
+                check(fresh.localFileHash == null || fresh.localFileHash == hash) { "文件内容与书架上的原书不同" }
                 // 只改本机才有意义的列，不动 updatedAt：书名/分组这些同步元数据没变，
                 // 盖新时间戳只会让这台设备在下次合并里无故「赢」一回。
                 val relinked = fresh.copy(
@@ -249,6 +337,7 @@ class BookRepository(
                     updatedAt = if (fresh.removedFromShelf) now else fresh.updatedAt,
                     type = type,
                     localPath = dest.absolutePath,
+                    localFileHash = hash,
                     coverPath = coverPath,
                     intro = fresh.intro ?: book.metadata.description?.htmlToPlainText(),
                     totalChapters = book.chapters.size,
@@ -272,6 +361,7 @@ class BookRepository(
                 coverPath = coverPath,
                 intro = book.metadata.description?.htmlToPlainText(),
                 localPath = dest.absolutePath,
+                localFileHash = dest.sha256(),
                 totalChapters = book.chapters.size,
                 addedAt = now,
                 updatedAt = now,
@@ -349,15 +439,15 @@ class BookRepository(
      * 删 N 本书架流就重发 N 次、整架跟着重排 N 遍。
      */
     suspend fun deleteBooks(ids: Collection<String>) = withContext(Dispatchers.IO) {
-        val books = ids.mapNotNull { bookDao.getById(it) }
-        if (books.isEmpty()) return@withContext
-        // 文件删除放在事务外：那是不可回滚的磁盘 IO，圈进来只会拉长锁。
-        books.forEach { deleteLocalFiles(it) }
-        // 几步写库成组提交：中途被杀会留下半套 —— 最糟的是目录已清、墓碑没打上，
-        // 书还在书架里但点进去是空目录，而且再删一次也修不好（文件早没了）。
-        val now = System.currentTimeMillis()
-        db.withWriteTransaction {
-            for (book in books) softDeleteRows(book.id, now)
+        localImportMutex.withLock {
+            val books = ids.mapNotNull { bookDao.getById(it) }
+            if (books.isEmpty()) return@withLock
+            // 与本地文件恢复串行。文件 IO 放在事务外，目录和删除标记成组提交。
+            books.forEach { deleteLocalFiles(it) }
+            val now = System.currentTimeMillis()
+            db.withWriteTransaction {
+                for (book in books) softDeleteRows(book.id, now)
+            }
         }
     }
 
@@ -439,13 +529,17 @@ class BookRepository(
      * 清掉一本书在本机的附属文件：导入的书文件、本地封面、正文缓存。删书、丢弃试读、
      * 同步来的远端删除都走这里。
      *
-     * 路径一律经 [deleteOwnedFile] 限定在 books/ 与 covers/ 之内：同步来的书行里，路径与 id
+     * 路径经 [deleteOwnedFile] 限定在对应的私有目录内：同步来的书行里，路径与 id
      * 都出自备份文件，不能拿来直接删（见那里的说明）。只做文件 IO，调用方负责在 IO 线程、事务之外调。
      */
     fun deleteLocalFiles(book: BookEntity) {
         // 解析缓存（txt 的解码正文 + 章节表）按书文件路径记，先于书文件本身清掉
-        book.localPath?.let { parserRegistry.evictCaches(File(it)) }
-        deleteOwnedFile(book.localPath, booksDir())
+        if (book.type == BookType.LOCAL_SERIES) {
+            seriesFiles.delete(book.localPath)
+        } else {
+            book.localPath?.let { parserRegistry.evictCaches(File(it)) }
+            deleteOwnedFile(book.localPath, booksDir())
+        }
         deleteOwnedFile(book.coverPath, coversDir())
         cache.clear(book.id)
     }
@@ -478,14 +572,141 @@ class BookRepository(
         bookDao.updateProgress(id, chapterIndex, charOffset, System.currentTimeMillis())
     }
 
-    /** 打开本地书文件（调用方负责 close） */
-    fun openLocal(book: BookEntity): BookHandle {
+    suspend fun volumesOf(book: BookEntity): List<LocalSeriesVolume> = withContext(Dispatchers.IO) {
+        readSeries(book).mapIndexed { index, volume ->
+            val current = bookDao.getById(volume.bookId)
+            val title = current?.takeIf { it.isLocalOriginal() && (!it.hidden || book.hidden) }?.title
+            volume.copy(title = title ?: "分卷 ${index + 1}（不可用）")
+        }
+    }
+
+    private fun readSeries(book: BookEntity): List<LocalSeriesVolume> {
+        require(book.type == BookType.LOCAL_SERIES)
+        return seriesFiles.read(book.localPath).also { volumes ->
+            require(volumes.size in 2..MAX_LOCAL_SERIES_VOLUMES &&
+                volumes.map { it.bookId }.distinct().size == volumes.size &&
+                volumes.all { it.chapterCount > 0 }
+            ) {
+                "合订本目录文件损坏"
+            }
+        }
+    }
+
+    suspend fun saveLocalSeries(title: String, volumeIds: List<String>, seriesId: String? = null): String =
+        withContext(Dispatchers.IO) {
+            localImportMutex.withLock {
+                val name = title.trim()
+                require(name.isNotEmpty() && name.length <= 120) { "请输入不超过 120 字的合订本名称" }
+                require(volumeIds.distinct().size == volumeIds.size && volumeIds.size in 2..MAX_LOCAL_SERIES_VOLUMES) {
+                    "请选择 2 到 $MAX_LOCAL_SERIES_VOLUMES 本本地书"
+                }
+                val originals = volumeIds.map { id ->
+                    val book = bookDao.getById(id)
+                    check(book != null && book.isLocalOriginal() && book.hasLocalFile()) {
+                        "有分卷已从书架移出或缺少原文件"
+                    }
+                    book
+                }
+                val existing = seriesId?.let { bookDao.getById(it) }
+                check(seriesId == null || (existing != null && existing.type == BookType.LOCAL_SERIES && !existing.deleted)) {
+                    "合订本已经移除"
+                }
+                require(originals.all { it.hidden == originals.first().hidden }) { "请选择同一书架中的分卷" }
+                require(existing?.hidden != false || !originals.first().hidden) { "请先将合订本移入私密书架" }
+                val id = seriesId ?: UUID.randomUUID().toString()
+                val chapters = mutableListOf<ChapterEntity>()
+                val catalogs = mutableListOf<VolumeCatalog>()
+                val volumes = originals.mapIndexed { volumeIndex, original ->
+                    openOriginal(original).use { handle ->
+                        require(handle.chapters.isNotEmpty()) { "「${original.title}」没有可读章节" }
+                        catalogs += VolumeCatalog(handle)
+                        val volume = "第 ${volumeIndex + 1} 卷"
+                        handle.chapters.forEach { chapter ->
+                            chapters += ChapterEntity(id, chapters.size, "$volume · 第 ${chapter.index + 1} 节")
+                        }
+                        LocalSeriesVolume(original.id, original.title, handle.chapters.size, original.localFileHash)
+                    }
+                }
+                val previousVolumeOrder = existing?.let(::readSeries)
+                val draft = seriesFiles.newManifest()
+                val now = System.currentTimeMillis()
+                try {
+                    draft.writeText(Json.encodeToString(volumes))
+                    seriesFiles.cacheCatalog(draft.absolutePath, catalogs)
+                    db.withWriteTransaction {
+                        val fresh = existing?.let { bookDao.getById(it.id) }
+                        check(existing == null || (fresh != null && fresh.localPath == existing.localPath && !fresh.deleted)) {
+                            "合订本已变更，请重新打开"
+                        }
+                        val base = fresh ?: BookEntity(
+                            id = id,
+                            type = BookType.LOCAL_SERIES,
+                            title = name,
+                            hidden = originals.first().hidden,
+                            addedAt = now,
+                            updatedAt = now,
+                        )
+                        val previous = previousVolumeOrder?.let { seriesPosition(it, base.readChapterIndex) }
+                        val mapped = previous?.let { seriesIndex(volumes, it) }
+                        bookDao.upsert(base.copy(
+                            title = name,
+                            localPath = draft.absolutePath,
+                            totalChapters = chapters.size,
+                            readChapterIndex = mapped ?: 0,
+                            readCharOffset = if (mapped != null) base.readCharOffset else 0,
+                            updatedAt = now,
+                        ))
+                        chapterDao.deleteByBook(id)
+                        chapterDao.upsertAll(chapters)
+                    }
+                } finally {
+                    withContext(NonCancellable) {
+                        if (bookDao.countByLocalPath(draft.absolutePath) == 0) {
+                            seriesFiles.delete(draft.absolutePath)
+                        } else {
+                            seriesFiles.delete(existing?.localPath)
+                        }
+                    }
+                }
+                id
+            }
+        }
+
+    /** 打开本地书文件或合订本（调用方负责 close）。 */
+    suspend fun openLocal(book: BookEntity): BookHandle {
+        if (book.type != BookType.LOCAL_SERIES) return openOriginal(book)
+        val volumes = readSeries(book)
+        val originals = volumes.map { volume ->
+            val original = bookDao.getById(volume.bookId)
+            check(
+                original != null && !original.deleted && original.type in BookType.LOCAL_TXT..BookType.LOCAL_MOBI &&
+                    (!original.hidden || book.hidden) && original.hasLocalFile(),
+            ) { "有分卷不可用，请检查原书架条目" }
+            check(volume.fileHash == null || volume.fileHash == original.localFileHash) {
+                "「${volume.title}」已更换原文件，请重新保存卷序"
+            }
+            original
+        }
+        fun open(index: Int): BookHandle {
+            val handle = openOriginal(originals[index])
+            if (handle.chapters.size == volumes[index].chapterCount) return handle
+            handle.close()
+            error("「${volumes[index].title}」目录已变更，请重新保存卷序")
+        }
+        val path = checkNotNull(book.localPath)
+        val catalogs = seriesFiles.readCatalog(path)?.takeIf { list ->
+            list.size == volumes.size && list.indices.all { list[it].titles.size == volumes[it].chapterCount }
+        } ?: volumes.indices.map { open(it).use(::VolumeCatalog) }.also { seriesFiles.cacheCatalog(path, it) }
+        return LocalSeriesHandle(book, volumes, catalogs, ::open)
+    }
+
+    private fun openOriginal(book: BookEntity): BookHandle {
         // 有路径、文件却不在，和没有路径是一回事：从云备份恢复的书行带着原来的路径，
         // 书文件本身不进 Auto Backup（见 res/xml/data_extraction_rules.xml）。不拦的话报的是一串文件路径
         val file = book.localPath?.let(::File)?.takeIf { it.isFile } ?: error(
             if (book.type == BookType.NET) "非本地书籍"
             // 同步只带书架信息、不带文件：别的设备导入的书在这台设备上只是一条占位
-            else "这本书的文件不在这台设备上，请在书架重新导入同一个文件",
+            else "这本书的原文件不在本机，可在 WebDAV 同步中恢复，或重新导入原文件",
         )
         return parserRegistry.open(file)
     }
@@ -499,7 +720,16 @@ class BookRepository(
 
 /** 孤儿缓存目录至少多久没碰过才删（[BookRepository.sweepContentCache]）：刚加的书可能还没落库，别跟它抢 */
 private const val ORPHAN_GRACE_MS = 86_400_000L
-private val BOOK_FILE_EXTENSIONS = setOf("txt", "epub", "mobi", "azw", "azw3")
+private val BOOK_FILE_TYPES = mapOf(
+    "txt" to BookType.LOCAL_TXT,
+    "epub" to BookType.LOCAL_EPUB,
+    "mobi" to BookType.LOCAL_MOBI,
+    "azw" to BookType.LOCAL_MOBI,
+    "azw3" to BookType.LOCAL_MOBI,
+)
+private val BOOK_FILE_EXTENSIONS = BOOK_FILE_TYPES.keys
+
+internal fun localBookTypeForExtension(extension: String): Int? = BOOK_FILE_TYPES[extension]
 
 /** 「同一本书」的判定键：书名 + 作者（去空白）。与搜索结果的合并键（SearchViewModel.merge）一致 */
 fun bookKey(title: String, author: String?): Pair<String, String> =

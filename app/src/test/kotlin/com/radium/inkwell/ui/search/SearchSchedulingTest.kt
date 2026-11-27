@@ -4,13 +4,13 @@ import com.radium.inkwell.core.source.BookSourceRule
 import com.radium.inkwell.core.source.BookSourceEngine
 import com.radium.inkwell.core.source.SearchRuleSet
 import com.radium.inkwell.core.source.SourceHttpClient
+import com.radium.inkwell.data.db.entity.BookEntity
+import com.radium.inkwell.data.db.entity.BookType
 import com.radium.inkwell.data.db.entity.CheckStatus
-import com.radium.inkwell.data.prefs.SourceSearchPriority
-import com.radium.inkwell.data.repo.AutoSourceSwitcher
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
@@ -30,80 +30,50 @@ import kotlin.test.assertTrue
 class SearchSchedulingTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    @Test
-    fun `高档实际执行完成前不启动低档并保留同档顺序`() = runTest {
-        val defaults = listOf("default-b", "default-a")
-        val levels = mapOf("highest-b" to SourceSearchPriority.HIGHEST, "highest-a" to SourceSearchPriority.HIGHEST, "high" to SourceSearchPriority.HIGH)
+    @Test fun 优先来源结束后才启动普通队列且各自只执行一次() = runTest {
         val started = mutableListOf<String>()
-        val highestGate = CompletableDeferred<Unit>()
-        val highGate = CompletableDeferred<Unit>()
-        val round = launch {
-            SearchScheduling.runRound(defaults + listOf("highest-b", "high", "highest-a"), { levels[it] ?: SourceSearchPriority.DEFAULT }) { id ->
-                started += id
-                if (id.startsWith("highest")) highestGate.await()
-                if (id == "high") highGate.await()
+        val finished = CompletableDeferred<Unit>()
+        val queue = listOf("regular-a", "marked", "regular-b")
+        val search = launch {
+            SearchScheduling.runPhases(queue, { it == "marked" }) {
+                started += it
+                if (it == "marked") finished.await()
             }
         }
         runCurrent()
-        assertEquals(listOf("highest-b", "highest-a"), started)
-        highestGate.complete(Unit)
-        runCurrent()
-        assertEquals(listOf("highest-b", "highest-a", "high"), started)
-        highGate.complete(Unit)
-        round.join()
-        assertEquals(listOf("highest-b", "highest-a", "high", "default-b", "default-a"), started)
+        assertEquals(listOf("marked"), started)
+        finished.complete(Unit)
+        search.join()
+        assertEquals(listOf("marked", "regular-a", "regular-b"), started)
+        assertEquals(listOf(queue), SearchScheduling.phases(queue) { false })
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    @Test
-    fun `暂停时低档不启动且同档仍受并发上限约束`() = runTest {
-        val started = mutableListOf<Int>()
-        val gate = CompletableDeferred<Unit>()
-        val round = launch {
-            SearchScheduling.runRound((0..20).toList(), { if (it < 20) SourceSearchPriority.HIGH else SourceSearchPriority.DEFAULT }) { id ->
-                started += id
-                gate.await()
-            }
-        }
-        runCurrent()
-        assertEquals((0 until SearchScheduling.CONCURRENCY).toList(), started)
-        round.cancelAndJoin()
-        assertEquals((0 until SearchScheduling.CONCURRENCY).toList(), started)
-    }
-
-    @Test
-    fun `实际搜索请求按档位抵达服务器`() = runBlocking {
+    @Test fun 实际搜索中优先失败后仍向普通来源发出请求() = runBlocking {
         MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(404))
+            server.enqueue(MockResponse().setBody("<div class='item'><span>测试书</span><a href='/book'>书</a></div>"))
             val engine = BookSourceEngine(SourceHttpClient(allowPrivateNetwork = true))
-            val candidates = listOf(SourceSearchPriority.DEFAULT, SourceSearchPriority.HIGH, SourceSearchPriority.HIGHEST).map { level ->
-                val rule = src(server.url("/").toString()).rule.copy(
-                    searchUrl = "/${level.name}?q={{key}}",
-                    ruleSearch = SearchRuleSet(bookList = "div.item", name = "span@text", bookUrl = "a@href"),
-                )
-                server.enqueue(MockResponse().setBody("<div class='item'><span class='t'>回归</span><a class='u' href='/book'>书</a></div>"))
-                rule to level
+            val books = mutableListOf<String>()
+            SearchScheduling.runPhases(listOf("regular", "marked"), { it == "marked" }) { id ->
+                val rule = BookSourceRule(server.url("/").toString(), searchUrl = "/$id?q={{key}}",
+                    ruleSearch = SearchRuleSet(bookList = "div.item", name = "span@text", bookUrl = "a@href"))
+                val result = runCatching { engine.search(rule, "测试书") }
+                if (id == "marked") assertTrue(result.isFailure)
+                else books += result.getOrThrow().items.map { it.title }
             }
-            SearchScheduling.runRound(candidates, { it.second }) { (rule, _) ->
-                assertEquals(1, engine.search(rule, "回归").items.size)
-            }
-            val requests = List(candidates.size) { server.takeRequest(3, TimeUnit.SECONDS)?.requestUrl?.encodedPath }
-            assertEquals(listOf("/HIGHEST", "/HIGH", "/DEFAULT"), requests)
+            assertEquals(listOf("/marked", "/regular"), List(2) { server.takeRequest(3, TimeUnit.SECONDS)?.requestUrl?.encodedPath })
+            assertEquals(listOf("测试书"), books)
         }
     }
 
-    @Test
-    fun `手动换源先搜索标记来源且排除当前来源`() = runTest {
-        val sources = listOf(src("current"), src("default", searchMs = 100), src("highest"), src("high"), src("high-hit"))
-        val priorities = mapOf(
-            "current" to SourceSearchPriority.HIGHEST,
-            "highest" to SourceSearchPriority.HIGHEST,
-            "high" to SourceSearchPriority.HIGH,
-            "high-hit" to SourceSearchPriority.HIGH,
-        )
-        val candidates = AutoSourceSwitcher.rank(sources, exclude = "current", bookHits = mapOf("default" to true, "high-hit" to true))
-        val started = mutableListOf<String>()
-        SearchScheduling.runRound(candidates, { priorities[it.id] ?: SourceSearchPriority.DEFAULT }) { started += it.id }
-        assertEquals(listOf("highest", "high-hit", "high", "default"), started)
+    @Test fun 单书标签仅在搜该书时优先当前绑定来源() {
+        val target = BookEntity(id = "saved", type = BookType.NET, title = "测试书", sourceId = "current", addedAt = 0, updatedAt = 0)
+        val settings = SearchPriorityPreferences(sourceIds = setOf("always"), bookIds = setOf(target.id))
+        assertEquals(setOf("always", "current"), SearchScheduling.prioritizedIds(settings, "《测试书》", listOf(target)))
+        assertEquals(setOf("always", "new"), SearchScheduling.prioritizedIds(settings, "测试书", listOf(target.copy(sourceId = "new"))))
+        assertEquals(setOf("always"), SearchScheduling.prioritizedIds(settings, "另一部", listOf(target)))
+        assertEquals(setOf("always"), SearchScheduling.prioritizedIds(settings, "测试书", listOf(target.copy(hidden = true))))
+        assertTrue(SearchScheduling.prioritizedIds(settings.copy(enabled = false), "测试书", listOf(target)).isEmpty())
     }
 
     private fun src(

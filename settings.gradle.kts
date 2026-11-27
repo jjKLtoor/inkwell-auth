@@ -30,7 +30,6 @@ rootProject.name = "inkwell"
 
 include(":app")
 include(":core")
-include(":source-auth")
 include(":reader")
 // 只跑在设备/模拟器上，产出 Baseline Profile 喂给 :app —— 不进包，不参与 assembleDebug
 include(":baselineprofile")

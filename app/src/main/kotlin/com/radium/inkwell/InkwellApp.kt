@@ -68,6 +68,7 @@ class InkwellApp : Application(), SingletonImageLoader.Factory {
         // 在库里，比偏好晚到，提前拉起来，免得按钮在首帧之后才冒出来、把旁边的按钮挤一下。
         // 放后台：构造它要连带建网络客户端，别占 onCreate 的主线程
         appScope.launch { runCatching { koin.get<RssRepository>() } }
+        appScope.launch { koin.get<BookRepository>().migrateSeriesManifests() }
 
         // 开发者模式下的运行日志：开关跟着偏好走，设置页拨开关、关开发者模式都在这里生效。
         // 放得靠前 —— 越早起 logcat，越不用担心启动那段被系统缓冲区挤掉
@@ -109,6 +110,11 @@ class InkwellApp : Application(), SingletonImageLoader.Factory {
                 koin.get<BookRepository>().sweepContentCache(days)
                 // 订阅页缓存的文章跟同一个天数走：订阅源里撤下、这么多天没再取到的清掉（见 RssFeedRepository.prune）
                 koin.get<RssFeedRepository>().prune(days)
+            }.onFailure { if (it is CancellationException) throw it }
+            // 规则更新过、删掉了的来源留下的登录会话（见 SourceLoginSessions.prune）
+            runCatching {
+                koin.get<com.radium.inkwell.data.source.SourceLoginSessions>()
+                    .prune { koin.get<com.radium.inkwell.data.repo.BookSourceRepository>().loginSessionIds() }
             }.onFailure { if (it is CancellationException) throw it }
         }
 

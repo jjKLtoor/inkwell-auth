@@ -37,6 +37,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.round
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
 import com.radium.inkwell.reader.api.FlipAnimation
@@ -112,8 +113,13 @@ fun PageFlipContainer(
     /** 点击分区：哪一格翻上一页、下一页、开菜单。见 [TapZones] */
     tapZones: TapZones = TapZones.DEFAULT,
     modifier: Modifier = Modifier,
-    /** 长按选中的文字；只在静止态（没在翻页）才可能非空 */
+    /** 长按选中的文字；只在静止态（没在翻页）才可能非空。非空时不接程序化翻页 */
     selection: TextSelection? = null,
+    /**
+     * 只画不拦的高亮（朗读到的那一段）。和 [selection] 分开：从前朗读高亮也从 selection 传进来，
+     * 被当成「正在选字」，菜单上滑动翻页、音量键这些程序化翻页全被拦下
+     */
+    highlight: TextSelection? = null,
     /**
      * 点在当前页的一张图上（含没取到的那条提示）。返回 true = 这一下处理掉了（点提示条重试），不再翻页 / 开菜单；
      * 点在真图上照旧按点击分区走，由调用方返回 false。
@@ -135,9 +141,10 @@ fun PageFlipContainer(
     val touchY = remember { mutableFloatStateOf(0f) }
     var downX by remember { mutableFloatStateOf(0f) }
     var cornerBottom by remember { mutableStateOf(true) }
-    // 中间横划（揪整页）vs 从角起手（揪角）。前者把触点 Y 钉在页边卷出竖直圆柱
+    // 钉 Y（揪整页，卷出竖直圆柱：中间横划、所有后翻）vs 前翻从上下三分之一起手（揪角）。见 curlGrip
     var flatSwipe by remember { mutableStateOf(false) }
     var direction by remember { mutableStateOf<FlipDirection?>(null) }
+    var lastCommittedDirection by remember { mutableStateOf<FlipDirection?>(null) }
     var flipId by remember { mutableStateOf(0) }
     var settling by remember { mutableStateOf(false) }
     var size by remember { mutableStateOf(IntSize.Zero) }
@@ -184,6 +191,7 @@ fun PageFlipContainer(
 
     fun commitFlip(dir: FlipDirection, reason: String, settleMs: Long? = null) {
         trace(ReaderTrace.Action.COMMIT, dir, reason, settleMs)
+        if (effectiveAnim == FlipAnimation.CURL) lastCommittedDirection = dir
         onCommitLatest(dir)
     }
 
@@ -371,6 +379,12 @@ fun PageFlipContainer(
                     var dragDir: FlipDirection? = null
                     var followedFlipId: Int? = null
                     fun isFollowing() = followedFlipId == flipId && direction != null && !settling
+                    fun traceSwipe(dir: FlipDirection, velocityX: Float, elapsed: Long) {
+                        val swipe = ReaderTrace.Swipe(
+                            down.position.round(), last.position.round(), size, elapsed, velocityX.toInt(),
+                        )
+                        traceLatest.value(ReaderTrace(ReaderTrace.Action.SWIPE_RELEASE, dir, followedFlipId, swipe = swipe))
+                    }
                     var cancelled = false
                     // 快甩时位移经常整段落在抬手那一帧。必须先判 slop 再看 pressed ——
                     // 先因 UP 跳出的话，offset 几乎是 0，松手当回弹，中间还会被当成开菜单。
@@ -413,17 +427,11 @@ fun PageFlipContainer(
                                 // NONE 分支提前 return、永不复位 direction，此后点击与拖拽翻页全被挡死。
                                 if (flippable && effectiveAnim != FlipAnimation.NONE) {
                                     val h = size.height.toFloat()
-                                    // 卷角在手势开始时锁定，拖拽中不再改变（避免翻页中途跳变）。
-                                    // 后翻一律用底角：从上半屏往回翻若按触点选顶角，会卷出很别扭的对角。
-                                    cornerBottom = dir == FlipDirection.BACKWARD || down.position.y > h / 2f
-                                    // 从屏幕**中间那一带**起手 = 想翻整页，不是揪角。这时把触点 Y 钉到卷角所在的
-                                    // 页边（不跟手指的 Y），折痕于是接近竖直、页面绕竖轴卷过去 —— 真书翻页的样子。
-                                    // 只有从上/下三分之一起手才让 Y 跟手，卷出斜的揪角效果。
-                                    //
-                                    // 从前一律跟手，中间横划就卷出一条贯穿全页的大斜折（"天差地别"那张图）。
-                                    // 当年试过钉边但崩了，根因是退化处理会把控制点塌回卷角 —— 那个已在
-                                    // CurlRenderer 用 ÷0.1 修好，这里才敢钉。
-                                    flatSwipe = down.position.y > h / 3f && down.position.y < h * 2 / 3f
+                                    // 卷角与触点 Y 在手势开始时锁定：后翻一律右下角、一律钉 Y；
+                                    // 前翻中间那一带钉 Y、上下三分之一揪角。两条互相牵连，规则与来由见 curlGrip
+                                    val grip = curlGrip(dir, down.position.y, h)
+                                    cornerBottom = grip.cornerBottom
+                                    flatSwipe = grip.pinTouchY
                                     touchY.floatValue = if (flatSwipe) {
                                         if (cornerBottom) h else 0f
                                     } else {
@@ -444,7 +452,7 @@ fun PageFlipContainer(
                                 val width = size.width.toFloat()
                                 val dir = dragDir
                                 // 拖拽路径直写状态，不经协程（每事件 launch 会造成输入延迟与分配抖动）。
-                                // 中间横划时 Y 保持钉在页边，不跟手指上下漂 —— 否则折痕会随手抖来抖去
+                                // 钉 Y 时（中间横划、所有后翻）Y 保持钉在页边，不跟手指上下漂 —— 否则折痕会随手抖来抖去
                                 touchY.floatValue = if (flatSwipe) {
                                     if (cornerBottom) size.height.toFloat() else 0f
                                 } else {
@@ -491,12 +499,13 @@ fun PageFlipContainer(
                     if (dragDir == null) {
                         val dx = last.position.x - down.position.x
                         val dy = last.position.y - down.position.y
+                        val velocity = tracker.calculateVelocity().x
                         val action = classifyReleaseBeforeSlop(
-                            dx, dy, tracker.calculateVelocity().x, flipSlopPx, FLIP_COMMIT_VELOCITY_PX,
+                            dx, dy, velocity, flipSlopPx, FLIP_COMMIT_VELOCITY_PX,
                         )
                         when (action) {
                             is FlipReleaseBeforeSlop.Flick -> {
-                                trace(ReaderTrace.Action.SWIPE_RELEASE, action.direction, id = null)
+                                traceSwipe(action.direction, velocity, (last.uptimeMillis - down.uptimeMillis).coerceAtLeast(0L))
                                 programmaticFlip(action.direction, "next_flick")
                             }
                             FlipReleaseBeforeSlop.Tap -> {
@@ -529,7 +538,9 @@ fun PageFlipContainer(
                         return@awaitEachGesture
                     }
                     val dir = dragDir
-                    trace(ReaderTrace.Action.SWIPE_RELEASE, dir, id = followedFlipId)
+                    val velocity = tracker.calculateVelocity().x
+                    val elapsed = (last.uptimeMillis - down.uptimeMillis).coerceAtLeast(0L)
+                    traceSwipe(dir, velocity, elapsed)
                     if (followedFlipId != null && !isFollowing()) return@awaitEachGesture
                     val flippable = canFlipLatest(dir)
                     val width = size.width.toFloat()
@@ -544,8 +555,6 @@ fun PageFlipContainer(
                         commitFlip(dir, if (animationsEnabled) "animation_none" else "system_animations_disabled")
                         return@awaitEachGesture
                     }
-                    val velocity = tracker.calculateVelocity().x
-                    val elapsed = (last.uptimeMillis - down.uptimeMillis).coerceAtLeast(0L)
                     val displacement = seedFlipOffset(last.position.x - down.position.x, dir, width)
                     val commit = shouldCommitHorizontalFlip(displacement, velocity, width, dir, elapsed)
                     if (isFollowing()) {
@@ -556,26 +565,31 @@ fun PageFlipContainer(
                 }
             },
     ) {
+        val painted = selection ?: highlight
         when (effectiveAnim) {
             // 滚动模式根本不该走到这里 —— 它是另一条渲染路径，由 ReaderScreen 分流。
             // 万一走到了（比如设置迁移遗漏），静态画当前页，总好过崩溃或白屏。
             FlipAnimation.NONE, FlipAnimation.SCROLL ->
-                PageCanvas(shownCurrent, layout, theme, selection = selection)
+                PageCanvas(shownCurrent, layout, theme, selection = painted)
             FlipAnimation.SLIDE -> SlideLayers(
-                selection, shownCurrent, shownPrev, shownNext, layout, theme, direction, offset, size.width.toFloat(),
+                painted, shownCurrent, shownPrev, shownNext, layout, theme, direction, offset, size.width.toFloat(),
             )
             FlipAnimation.COVER -> CoverLayers(
-                selection, shownCurrent, shownPrev, shownNext, layout, theme, direction, offset, size.width.toFloat(),
+                painted, shownCurrent, shownPrev, shownNext, layout, theme, direction, offset, size.width.toFloat(),
             )
             FlipAnimation.CURL -> CurlLayer(
-                selection = selection,
+                selection = painted,
                 current = shownCurrent, prev = shownPrev, next = shownNext,
+                // heldPages 只有两页。预渲染跟随真实邻页，避免短暂的空槽淘汰仍可复用的位图。
+                request = CurlRequest(current, prev, next, layout, theme, density),
+                preferPrevious = lastCommittedDirection == FlipDirection.BACKWARD,
                 layout = layout, theme = theme, direction = direction,
                 offset = offset,
                 touchX = touchX,
                 downX = downX,
                 touchY = touchY,
                 cornerBottom = cornerBottom,
+                pinTouchY = flatSwipe,
                 size = size, density = density,
                 flipId = flipId, onTrace = { traceLatest.value(it) },
             )
@@ -662,6 +676,8 @@ private fun CurlLayer(
     current: RenderablePage?,
     prev: RenderablePage?,
     next: RenderablePage?,
+    request: CurlRequest,
+    preferPrevious: Boolean,
     layout: LayoutSpec,
     theme: ReaderTheme,
     direction: FlipDirection?,
@@ -670,6 +686,7 @@ private fun CurlLayer(
     downX: Float,
     touchY: MutableFloatState,
     cornerBottom: Boolean,
+    pinTouchY: Boolean,
     size: IntSize,
     density: androidx.compose.ui.unit.Density,
     flipId: Int,
@@ -692,31 +709,41 @@ private fun CurlLayer(
     //
     // 正在烤的那一轮仍然 NonCancellable：渲染本身没有挂起点，取消也停不下来，取消只会让 withContext
     // 把结果扔掉 —— 新渲出来的位图就没人 recycle 了。烤完总能拿到结果，要么交出去、要么回收。
-    val request = CurlRequest(current, prev, next, layout, theme, density)
     val latestRequest = rememberUpdatedState(request)
+    val latestPreferPrevious = rememberUpdatedState(preferPrevious)
     LaunchedEffect(Unit) {
+        suspend fun renderAndPublish(req: CurlRequest, previousOnly: Boolean = false) {
+            val old = bitmaps
+            val produced = withContext(Dispatchers.Default + NonCancellable) {
+                renderCurlBitmaps(old, req, previousOnly)
+            }
+            if (produced === old) return
+            if (!isActive) {
+                // 没交出去：只回收相对 old 新渲的那几张，共用槽不能动
+                produced.recycleFresh(old)
+                return
+            }
+            bitmaps = produced
+            // 回收宽限期不阻塞下一轮位图渲染。之后的请求只会复用 produced 里仍持有的槽。
+            if (old != null) launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    delay(32)
+                    old.recycleUnused(produced)
+                }
+            }
+        }
         snapshotFlow { latestRequest.value }
             .distinctUntilChanged { a, b -> a.sameContent(b) }
             .conflate()
             .collect { req ->
-                val old = bitmaps
-                val produced = withContext(Dispatchers.Default + NonCancellable) {
-                    renderCurlBitmaps(old, req)
+                val reusable = bitmaps?.takeIf { it.matchesStyle(req) }
+                fun missing(page: RenderablePage?) = page != null && reusable?.bitmapFor(page.curlKey()) == null
+                // 后翻卷起的是上一页。多张待生成时，先交付上一页，让下一刀能直接用。
+                if (latestPreferPrevious.value && missing(req.prev) && (missing(req.current) || missing(req.next))) {
+                    renderAndPublish(req, previousOnly = true)
+                    if (!isActive) return@collect
                 }
-                if (produced === old) return@collect
-                if (!isActive) {
-                    // 没交出去：只回收相对 old 新渲的那几张，共用槽不能动
-                    produced.recycleFresh(old)
-                    return@collect
-                }
-                bitmaps = produced
-                // 回收宽限期不阻塞下一轮位图渲染。之后的请求只会复用 produced 里仍持有的槽。
-                if (old != null) launch(start = CoroutineStart.UNDISPATCHED) {
-                    withContext(NonCancellable) {
-                        delay(32)
-                        old.recycleUnused(produced)
-                    }
-                }
+                renderAndPublish(req)
             }
     }
     if (size.width <= 1 || size.height <= 1) {
@@ -731,6 +758,25 @@ private fun CurlLayer(
     }
     val frontPage = if (direction == FlipDirection.FORWARD) current else prev
     val underPage = if (direction == FlipDirection.FORWARD) next else current
+    val grip = CurlGrip(cornerBottom, pinTouchY)
+    // 连翻可在上一页提交的同一帧启动，但 ViewModel 的相邻页还未跟上。
+    // 本次先显示整页，避免卷开空白页，也避免相邻页到齐后从动画中途突然出现。
+    val missingPageReason = when {
+        frontPage == null -> "front_page_unavailable"
+        underPage == null -> "under_page_unavailable"
+        else -> null
+    }
+    val pendingPage = remember(flipId) { missingPageReason } ?: missingPageReason
+    if (pendingPage != null) {
+        LaunchedEffect(flipId, pendingPage) {
+            onTrace(
+                ReaderTrace(ReaderTrace.Action.RENDER_SELECTED, direction, flipId,
+                    ReaderTrace.Render.CURL_PENDING_PAGE, pendingPage, curlGrip = grip),
+            )
+        }
+        PageCanvas(current, layout, theme, selection = selection)
+        return
+    }
     // 连翻后可直接找上一轮相同内容的图，不必等后台把位图挪到新的槽位。
     val matching = bitmaps?.takeIf { it.matchesStyle(request) }
     val frontBitmap = frontPage?.let { matching?.bitmapFor(it.curlKey()) }
@@ -743,22 +789,19 @@ private fun CurlLayer(
     val render = when {
         liveFront != null -> ReaderTrace.Render.CURL_LIVE_FRONT
         front == null -> ReaderTrace.Render.SLIDE
-        under != null -> ReaderTrace.Render.CURL_BITMAPS
-        underPage != null -> ReaderTrace.Render.CURL_LIVE_UNDER
-        else -> ReaderTrace.Render.CURL_PAPER_UNDER
+        under == null -> ReaderTrace.Render.CURL_LIVE_UNDER
+        else -> ReaderTrace.Render.CURL_BITMAPS
     }
     val reason = when (render) {
         ReaderTrace.Render.SLIDE, ReaderTrace.Render.CURL_LIVE_FRONT -> when {
-            frontPage == null -> "front_page_unavailable"
             startedWithFront -> "front_bitmap_invalidated"
             else -> "front_bitmap_not_ready_at_start"
         }
         ReaderTrace.Render.CURL_LIVE_UNDER -> "under_bitmap_not_ready"
-        ReaderTrace.Render.CURL_PAPER_UNDER -> "under_page_unavailable"
         else -> null
     }
     LaunchedEffect(flipId, render, reason) {
-        onTrace(ReaderTrace(ReaderTrace.Action.RENDER_SELECTED, direction, flipId, render, reason))
+        onTrace(ReaderTrace(ReaderTrace.Action.RENDER_SELECTED, direction, flipId, render, reason, curlGrip = grip))
     }
     if (render == ReaderTrace.Render.SLIDE) {
         SlideLayers(
@@ -787,6 +830,7 @@ private fun CurlLayer(
                     paperColor = theme.background.toInt(),
                     drawLiveUnder = drawLiveUnder,
                     drawLiveFront = drawLiveFront,
+                    back = frontBitmap,
                 )
             }
         }
@@ -841,7 +885,7 @@ private class CurlRequest(
  * 版式、纸张、密度变了则一张都用不上 —— 字的位置、颜色、像素全不一样。
  * 什么都没变时原样返回 [old]，调用方据此跳过提交。
  */
-private fun renderCurlBitmaps(old: CurlBitmaps?, req: CurlRequest): CurlBitmaps {
+private fun renderCurlBitmaps(old: CurlBitmaps?, req: CurlRequest, previousOnly: Boolean): CurlBitmaps {
     val reusable = old?.takeIf { it.matchesStyle(req) }
     if (reusable != null &&
         req.current.matches(reusable.currentKey) &&
@@ -850,18 +894,22 @@ private fun renderCurlBitmaps(old: CurlBitmaps?, req: CurlRequest): CurlBitmaps 
     ) {
         return reusable
     }
-    fun obtain(page: RenderablePage?): android.graphics.Bitmap? {
+    fun obtain(page: RenderablePage?, renderIfMissing: Boolean): android.graphics.Bitmap? {
         if (page == null) return null
         reusable?.bitmapFor(page.curlKey())?.let { return it }
+        if (!renderIfMissing) return null
         return renderPageAndroidBitmap(page, req.layout, req.theme, req.density)
     }
+    val current = obtain(req.current, renderIfMissing = !previousOnly)
+    val prev = obtain(req.prev, renderIfMissing = true)
+    val next = obtain(req.next, renderIfMissing = !previousOnly)
     return CurlBitmaps(
-        current = obtain(req.current),
-        prev = obtain(req.prev),
-        next = obtain(req.next),
-        currentKey = req.current?.curlKey(),
-        prevKey = req.prev?.curlKey(),
-        nextKey = req.next?.curlKey(),
+        current = current,
+        prev = prev,
+        next = next,
+        currentKey = req.current?.curlKey().takeIf { current != null },
+        prevKey = req.prev?.curlKey().takeIf { prev != null },
+        nextKey = req.next?.curlKey().takeIf { next != null },
         layout = req.layout,
         theme = req.theme,
         density = req.density,

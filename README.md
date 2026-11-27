@@ -1,10 +1,8 @@
 # Inkwell · 墨水
 
-最新结果见 [起点与 QQ 阅读续查记录](docs/开发记录/起点与QQ阅读续查.md)：通用登录请求配置与渲染时序修正后，起点、QQ 阅读取得当前 Debug 包的真实全链路通过证据；番茄此前候选包也有通过记录。不同来源、作品和 Release 包仍需分别验证。
-
-> 本 Fork 正在开发通用来源认证。当前支持受能力限制的 HTTPS 网页登录、Keystore 加密持久 Cookie / 认证 Header，以及阅读引擎的来源会话接入；保存会话不代表来源已确认登录或真实站点测试通过。进度与测试边界见 [最新开发记录](docs/开发记录/起点与QQ阅读续查.md) 和 [未完成项](docs/待办任务.md)，本地构建见 [Windows 开发环境](docs/Windows开发环境.md)。
-
 > 一款克制、专注的文本阅读器 —— 暖纸质感、仿真翻页、进度永不丢失。本地 txt / EPUB / MOBI(AZW3) 阅读 · 可选自定义规则 · WebDAV 跨端同步。Android 客户端无需账号；[网页版](https://book.skylark.run) 需登录注册后使用。
+
+[安卓 APK 官方下载](https://book.skylark.run/android) · [TXT 和 EPUB 离线朗读教程](https://book.skylark.run/guide/read-aloud)
 
 ![platform](https://img.shields.io/badge/Android-13%2B%20(minSdk%2033)-3DDC84?logo=android&logoColor=white)
 [![web](https://img.shields.io/badge/Web-book.skylark.run-111111)](https://book.skylark.run)
@@ -13,7 +11,7 @@
 ![license](https://img.shields.io/badge/License-MIT-blue)
 [![release](https://img.shields.io/github/v/release/radiumCN/inkwell?display_name=tag)](https://github.com/radiumCN/inkwell/releases)
 
-Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号、没有推送。排版引擎全自绘、进度以「章节 + 章内偏移」为真身，改字号也不丢位置；书架、进度与用户配置可通过 WebDAV 单文件同步，书籍文件不上云。另有[网页版](https://book.skylark.run)，使用书架与阅读需先登录注册，与 App 填同一套 WebDAV 即可同步。**默认不内置任何第三方内容或访问规则**；规则如需使用，均由用户自行导入并对其合法性负责（见下方免责声明）。
+Inkwell Android 用 Jetpack Compose 从零写成，没有广告、无需账号即可本地阅读、没有推送。排版引擎全自绘、进度以「章节 + 章内偏移」为真身，改字号也不丢位置；书架、进度与用户配置可通过 WebDAV 单文件同步，本地书原文件可手动备份。另有[网页版](https://book.skylark.run)，使用书架与阅读需先登录注册，与 App 填同一套 WebDAV 即可同步。**默认不内置任何第三方内容或访问规则**；规则如需使用，均由用户自行导入并对其合法性负责（见下方免责声明）。
 
 ## ✨ 功能特性
 
@@ -25,6 +23,7 @@ Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号�
 - 排版：字号、行距、段距、字距、首行缩进、两端对齐、标题与边距均可调；常用组合可存成「排版方案」一键切换，随 WebDAV 同步。纸色按日 / 夜各记一套，不进方案。
 - 阅读记录：只算翻页之间的时间，统计今日 / 本周 / 今年 / 累计时长、连续天数、每日热力图与今年读得最多的书；多台设备的时长随 WebDAV 合在一起。
 - 阅读中可切换用户已配置的规则来源；同一次阅读会话内会复用已找到的候选，不必每次重搜。
+- 在来源详情标记「优先搜索此来源」，全局首轮搜索和手动换源会先搜已标记的来源。在书架的书籍详情可为该书优先搜索它当前绑定的来源。
 
 **书架与规则**
 - 本地导入 txt / EPUB / MOBI(AZW3)，与经用户规则加载的内容统一为 `ContentElement` 段落流，一套引擎渲染；同名同作者的本地书不会重复入库。
@@ -38,13 +37,13 @@ Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号�
 - 离线缓存：网络书可缓存往后 50 章、到最后一章或全本，离开详情页照常进行，已缓存的章自动跳过。
 - 主题可「跟随壁纸」取色；书籍详情页按封面换强调色。
 - 分组筛选、书内 / 全局搜索、可开关的发现入口（仅在用户已导入相应规则时可用）。
-- 在「来源管理 → 来源详情 → 搜索优先级」按来源设置最高、优先或默认。首轮全局搜索和手动换源先搜索较高档，这个设置保存在本机。
 - 长按书籍弹出操作面板（详情 / 分组 / 删除等）；面板内可进入多选，批量删除、分组或隐藏。
 - 私密书架：可选生物识别 / 密码保护的隐藏分区，入口本身不可见（长按书架标题进入）。
 - RSS 订阅：导入订阅源、浏览文章列表与正文。
 
 **同步与维护**
 - WebDAV 单文件（`inkwell/backup.json.gz`）增量同步，字段级 Last-Write-Wins 合并（进度按 `readAt`、元数据按 `updatedAt`）；凭据经系统密钥库加密存放。
+- Android 可将选中的本地书原文件手动备份至 `inkwell/books/`。换机后先同步书架，再恢复原文件即可接着读。官方同步页显示账号已用空间和总配额。
 - [网页版](https://book.skylark.run)（需登录注册）：书架、来源与阅读；与 App 共用同一套 WebDAV，读写同一份备份文件。
 - 设置页直接显示上次同步时间；自动同步失败时写明原因。
 - 同步上传使用远端版本校验，遇到其他设备同时修改会重新合并；远端备份损坏或版本不受支持时保留原文件。服务器需正确支持强 ETag 与条件写入；未提供强 ETag 时仍可拉取更新，暂停覆盖上传。
@@ -58,7 +57,6 @@ Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号�
 | `:core` | 纯 JVM：统一书籍模型、txt/EPUB/MOBI 解析器、可选规则引擎（含 Rhino JS）、WebDAV 客户端与备份合并（全部可 JVM 单测） |
 | `:reader` | 阅读排版引擎：Canvas 自绘 + `TextMeasurer` 分页；测量层抽象为接口，分页算法纯 Kotlin 可测 |
 | `:app` | Compose UI、Room、DataStore、导航、DI（Koin）、同步 |
-| `:source-auth` | Android 来源认证：独立 WebView profile、加密会话、来源隔离与引擎认证适配 |
 
 技术栈：Kotlin 2.3 · Jetpack Compose · Room · Koin · OkHttp · Jsoup · Rhino · kotlinx.serialization。
 
@@ -140,10 +138,11 @@ Inkwell Android 用 Jetpack Compose 从零写成，没有广告、没有账号�
 
 ## 📦 下载与发布
 
-- **下载**：前往 [Releases](https://github.com/radiumCN/inkwell/releases) 获取签名 APK。应用内「设置 → 检查更新」也可直接拉取。
+- **下载** [官网安卓下载页](https://book.skylark.run/android)提供稳定版签名 APK 和安装说明。[GitHub Releases](https://github.com/radiumCN/inkwell/releases)提供各版本安装包。已安装用户可打开「设置 → 检查更新」。
 - **网页版**：打开 [book.skylark.run](https://book.skylark.run)。官网可直接浏览；使用书架与阅读需登录注册。与 App 填同一套 WebDAV 即可同步进度、来源与设置。
 - **发版流程**：改 `gradle/libs.versions.toml` 的 `inkwell` 版本号 → 提交 → 打**带注解**的 tag（`git tag -a vX.Y.Z`）→ 推送 tag。CI 校验 tag 与版本号一致后自动构建签名 APK 并发布 Release。
 - **Release 正文取自 tag 注解本身**，且应用内更新弹窗按**纯文本**渲染 —— tag 注解请写纯文本、不要用 Markdown。
+- 稳定版 tag 注解结尾加一行 `安卓 APK 官方下载 https://book.skylark.run/android`，让 GitHub Release 和应用内更新说明都能指向官网。
 - 带 `-` 后缀的 tag（如 `v0.1.9-beta.7`）会标为预发布，只推测试渠道。
 
 ## ⚠️ 用户协议与免责声明

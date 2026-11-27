@@ -9,10 +9,8 @@ plugins {
 android {
     namespace = "com.radium.inkwell"
     compileSdk = 37
-    // 按 37.1 编译。最早是 Compose 1.13 beta（alpha BOM）的 AAR 元数据要求的，37.0 在 checkAarMetadata 就挂；
-    // 回到稳定 BOM 后没再去掉：同期的 activity / lifecycle 也在往 37.1 走，CI 的三条工作流都已经装好 37.1。
-    // 只影响编译期可见的 API，targetSdk 与运行行为不变。
-    compileSdkMinor = 1
+    // Miuix 的 AAR 元数据要求 37.2。CI 三条工作流安装同一平台。
+    compileSdkMinor = 2
 
     defaultConfig {
         applicationId = "com.radium.inkwell"
@@ -122,8 +120,6 @@ tasks.withType<Test>().configureEach {
 }
 
 dependencies {
-    implementation(project(":source-auth"))
-    implementation(libs.androidx.webkit)
     implementation(project(":core"))
     implementation(project(":reader"))
 
@@ -145,11 +141,13 @@ dependencies {
     implementation(libs.miuix.preference)
     implementation(libs.miuix.icons)
     implementation(libs.miuix.blur)
+    implementation(libs.miuix.material)
     implementation(libs.compose.material.icons)
     implementation(libs.compose.ui.tooling.preview)
     debugImplementation(libs.compose.ui.tooling)
 
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.webkit)
     implementation(libs.androidx.navigation3.runtime)
     implementation(libs.androidx.navigation3.ui)
     implementation(libs.androidx.lifecycle.viewmodel.navigation3)
@@ -180,8 +178,6 @@ dependencies {
     testImplementation(libs.sqlite.bundled.jvm)
 
     // WebView 渲染只能在真机/模拟器上验证，JVM 单测覆盖不到
-    androidTestImplementation(libs.androidx.test.uiautomator)
-    androidTestImplementation(libs.jsoup)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.kotlinx.coroutines.test)

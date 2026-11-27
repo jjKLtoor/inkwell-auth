@@ -3,6 +3,7 @@ package com.radium.inkwell.ui.sourcedetail
 import com.radium.inkwell.ui.components.AppScaffold
 import com.radium.inkwell.ui.components.horizontalOnly
 import com.radium.inkwell.ui.components.pageScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import com.radium.inkwell.ui.components.AppSnackbarHost
 import com.radium.inkwell.ui.components.AppTopBar
@@ -24,13 +26,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.radium.inkwell.data.prefs.SourceSearchPriority
 import com.radium.inkwell.ui.components.CollectMessages
 import com.radium.inkwell.ui.components.CompactTextField
 import com.radium.inkwell.ui.components.SettingGroup
 import com.radium.inkwell.ui.components.SettingBlock
-import com.radium.inkwell.ui.components.PickerOption
-import com.radium.inkwell.ui.components.SpinnerSettingRow
+import com.radium.inkwell.ui.components.SwitchRow
 import com.radium.inkwell.ui.components.SectionHeader
 import com.radium.inkwell.ui.components.Dimens
 import com.radium.inkwell.ui.components.SecondaryButton
@@ -50,13 +50,18 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 fun SourceDetailScreen(
     sourceId: String,
     onBack: () -> Unit,
-    onLogin: () -> Unit,
     viewModel: SourceDetailViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val searchPriority by viewModel.searchPriority.collectAsStateWithLifecycle(initialValue = false)
     val snackbar = remember { SnackbarHostState() }
 
     CollectMessages(viewModel.messages, snackbar)
+    val loginBrowser = state.loginBrowser
+    if (loginBrowser != null) {
+        SourceLoginBrowser(loginBrowser, snackbar, viewModel::closeLoginBrowser, viewModel::finishLoginBrowser)
+        return
+    }
 
     val pageColor = settingsPageColor()
     val topBarScroll = rememberAppTopBarScroll()
@@ -101,21 +106,34 @@ fun SourceDetailScreen(
                 .verticalScroll(rememberScrollState(), overscrollEffect = null)
                 .padding(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding()),
         ) {
-            SectionHeader("来源登录")
-            SettingGroup {
-                SettingBlock {
-                    SecondaryButton(text = "登录与会话", onClick = onLogin, modifier = Modifier.fillMaxWidth())
+            if (state.hasLogin) {
+                SectionHeader("来源登录")
+                SettingGroup {
+                    SettingBlock {
+                        val form = state.loginForm
+                        if (form == null) {
+                            SecondaryButton(
+                                text = "打开登录",
+                                onClick = viewModel::openLogin,
+                                enabled = !state.loginBusy,
+                                loading = state.loginBusy,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            SourceLoginFields(form, state.loginBusy, viewModel::updateLoginField, viewModel::submitLogin)
+                        }
+                        state.loginDiagnostic?.let { diagnostic ->
+                            Text(
+                                diagnostic,
+                                style = MiuixTheme.textStyles.footnote1,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
                 }
             }
             if (state.searchable) {
-                SectionHeader("搜索")
-                SpinnerSettingRow(
-                    title = "搜索优先级",
-                    options = SourceSearchPriority.entries.map { PickerOption(it.name, it.label) },
-                    selectedId = state.searchPriority?.name,
-                    onSelect = { viewModel.setSearchPriority(SourceSearchPriority.valueOf(it.id)) },
-                    enabled = state.searchPriority != null && !state.savingPriority,
-                )
+                SwitchRow("优先搜索此来源", checked = searchPriority, onCheckedChange = viewModel::setSearchPriority)
             }
             // 控件装进卡里（设置类页面的骨架）：输入框的底是卡上的那一档，直接铺在灰底上几乎看不出框
             SectionHeader("全链路测试")
@@ -152,7 +170,14 @@ fun SourceDetailScreen(
             SectionHeader("规则（只读，要改请重新导入或重新新建）")
             SettingGroup {
                 SettingBlock {
-                    SourceRulePreview(state.jsonText)
+                    // 只读展示：可选中复制，横向滚动避免长规则折行
+                    SelectionContainer {
+                        Text(
+                            state.jsonText,
+                            style = MiuixTheme.textStyles.footnote1.copy(fontFamily = FontFamily.Monospace),
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        )
+                    }
                 }
             }
         }

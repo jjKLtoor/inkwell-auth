@@ -27,6 +27,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.koin.compose.koinInject
 import com.radium.inkwell.data.prefs.AppPrefs
+import com.radium.inkwell.data.prefs.FeedbackReceipt
+import com.radium.inkwell.data.repo.FeedbackRepository
 import com.radium.inkwell.ui.components.AppAlertDialog
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -57,6 +59,8 @@ import androidx.navigationevent.NavigationEventTransitionState
 import androidx.navigationevent.compose.LocalNavigationEventDispatcherOwner
 import com.radium.inkwell.ui.explore.ExploreViewModel
 import com.radium.inkwell.ui.feedback.FeedbackScreen
+import com.radium.inkwell.ui.feedback.FeedbackDiscussionScreen
+import com.radium.inkwell.ui.feedback.FeedbackHistoryScreen
 import com.radium.inkwell.ui.feedback.FeedbackViewModel
 import com.radium.inkwell.ui.preview.BookPreviewScreen
 import com.radium.inkwell.ui.preview.BookPreviewViewModel
@@ -104,9 +108,17 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun InkwellNavDisplay(
     externalBook: Intent? = null,
     onExternalBookHandled: (Intent) -> Unit = {},
+    openReadingStats: Boolean = false,
+    onReadingStatsOpened: () -> Unit = {},
 ) {
     val backStack = rememberNavBackStack(BookshelfRoute)
     val nav = remember(backStack) { InkwellNavigator(backStack) }
+    LaunchedEffect(openReadingStats) {
+        if (openReadingStats) {
+            if (backStack.lastOrNull() != ReadingStatsRoute) nav.go(ReadingStatsRoute)
+            onReadingStatsOpened()
+        }
+    }
     LaunchedEffect(backStack) {
         snapshotFlow { backStack.lastOrNull() }.collect { route ->
             UsageLog.screenVisible(route.diagnosticName(), backStack.size)
@@ -341,13 +353,8 @@ fun InkwellNavDisplay(
                 SourceDetailScreen(
                     sourceId = route.sourceId,
                     onBack = { nav.back() },
-                    onLogin = { nav.go(SourceLoginRoute(route.sourceId)) },
                     viewModel = vm,
                 )
-            }
-            entry<SourceLoginRoute> {
-                val vm = koinViewModel<com.radium.inkwell.ui.sourceauth.SourceLoginViewModel> { parametersOf(it.sourceId) }
-                com.radium.inkwell.ui.sourceauth.SourceLoginScreen(onBack = { nav.back() }, viewModel = vm)
             }
             entry<SettingsRoute>(
                 metadata = ListDetailSceneStrategy.listPane(
@@ -475,7 +482,38 @@ fun InkwellNavDisplay(
                 metadata = ListDetailSceneStrategy.extraPane(sceneKey = NavPaneGroup.SETTINGS),
             ) {
                 val vm = koinViewModel<FeedbackViewModel>()
-                FeedbackScreen(onBack = { nav.back() }, viewModel = vm)
+                FeedbackScreen(
+                    onBack = { nav.back() },
+                    onOpenHistory = { nav.go(FeedbackHistoryRoute) },
+                    onOpenDiscussion = { receipt ->
+                        if (backStack.lastOrNull() == FeedbackRoute) {
+                            nav.go(FeedbackHistoryRoute)
+                            nav.go(FeedbackDiscussionRoute(receipt.issue, receipt.url, receipt.title))
+                        }
+                    },
+                    viewModel = vm,
+                )
+            }
+            entry<FeedbackHistoryRoute> {
+                val prefs = koinInject<AppPrefs>()
+                val receipts by prefs.feedbackReceipts.collectAsStateWithLifecycle(initialValue = emptyList())
+                FeedbackHistoryScreen(
+                    receipts = receipts,
+                    onSelect = { nav.go(FeedbackDiscussionRoute(it.issue, it.url, it.title)) },
+                    onBack = { nav.back() },
+                )
+            }
+            entry<FeedbackDiscussionRoute> { route ->
+                val prefs = koinInject<AppPrefs>()
+                val receiptFlow = remember(prefs, route) { prefs.feedbackReceipt(route.issue, route.url) }
+                val savedReceipt by receiptFlow.collectAsStateWithLifecycle(initialValue = null)
+                val receipt = savedReceipt ?: FeedbackReceipt(route.issue, route.url, route.title)
+                FeedbackDiscussionScreen(
+                    receipt = receipt,
+                    repo = koinInject<FeedbackRepository>(),
+                    recorder = koinInject(),
+                    onBack = { nav.back() },
+                )
             }
             entry<DisclaimerRoute>(
                 metadata = ListDetailSceneStrategy.extraPane(sceneKey = NavPaneGroup.SETTINGS),

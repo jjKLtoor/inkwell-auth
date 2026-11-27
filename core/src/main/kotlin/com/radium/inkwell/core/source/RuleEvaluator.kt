@@ -3,7 +3,14 @@ package com.radium.inkwell.core.source
 import com.jayway.jsonpath.Configuration
 import com.jayway.jsonpath.JsonPath
 import com.jayway.jsonpath.Option
+import com.radium.inkwell.core.source.js.LOGIN_SCOPE_BINDING
+import com.radium.inkwell.core.source.js.EngineJsHttp
+import com.radium.inkwell.core.source.js.ScriptJson
+import com.radium.inkwell.core.source.js.SourceBridge
+import com.radium.inkwell.core.source.js.StrResponse
 import com.radium.inkwell.core.source.rss.RssXmlParser
+import kotlinx.coroutines.ensureActive
+import kotlinx.serialization.json.Json
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -100,8 +107,7 @@ data class JsContext(
     val scriptVars: MutableMap<String, String> = ConcurrentHashMap(),
     /** 源的公共脚本库（阅读的 jsLib）：规则、模板、地址里的脚本都能调它定义的函数 */
     val jsLib: String? = null,
-    val interaction: com.radium.inkwell.core.source.js.SourceScriptInteraction? = null,
-    val strictScripts: Boolean = false,
+    val loginSessionId: String? = null,
 )
 
 /** 规则求值器；正则按 pattern 缓存预编译；scriptRuntime 为空时 js 规则报不支持 */
@@ -109,13 +115,18 @@ class RuleEvaluator(
     private val scriptRuntime: com.radium.inkwell.core.source.js.ScriptRuntime? = null,
     /** 书源脚本的 HTTP 出口（java.ajax/get/post、cookie 读写）；不注入则这些方法返回空 */
     private val jsHttp: com.radium.inkwell.core.source.js.JsHttp? = null,
+    private val sessionStore: SourceSessionStore? = null,
 ) {
 
     private val jsCache = com.radium.inkwell.core.source.js.JsCache()
+    private val loginCaches = ConcurrentHashMap<String, com.radium.inkwell.core.source.js.JsCache>()
 
     /** 书源级 KV（source.put/get），按书源留存，跨抓取链路可见 */
     private val sourceStores =
-        ConcurrentHashMap<String, MutableMap<String, String>>()
+        ConcurrentHashMap<Pair<String, String?>, MutableMap<String, String>>()
+
+    /** 每个来源一把，见 [runLogin] */
+    private val loginLocks = ConcurrentHashMap<String, Any>()
 
     private val regexCache = object : LinkedHashMap<String, Regex>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Regex>?): Boolean =
@@ -159,6 +170,8 @@ class RuleEvaluator(
     fun evalToNodes(node: RuleNode, ctx: EvalContext): List<EvalContext> = when (node) {
         is RuleNode.Legado -> bareJsonPath(node.rule, ctx)
             ?.let { path -> evalToNodes(LegadoRuleAnalyzer.analyzeAsJson(node.rule) ?: RuleNode.JsonPath(path), ctx) }
+            ?: implicitXPath(node.rule, ctx)
+                ?.let { path -> xpathNodes(withGetVars(path, ctx), ctx).map { ctx.copy(element = it, json = null) } }
             ?: ctx.element
                 ?.let { LegadoSelector.elements(it, withGetVars(node.rule, ctx)) }
                 ?.map { ctx.copy(element = it, json = null) }
@@ -170,7 +183,7 @@ class RuleEvaluator(
             else -> listOf(ctx.copy(element = null, json = r))
         }
         is RuleNode.RegexRule ->
-            regexExtract(node.pattern, ctx).map { ctx.copy(element = null, json = it) }
+            regexMatches(node.pattern, ctx).map { ctx.copy(element = null, json = RegexGroups(it)) }
         is RuleNode.Literal ->
             expandTemplate(node.template, ctx)
                 .takeIf { it.isNotBlank() }
@@ -323,7 +336,7 @@ class RuleEvaluator(
 
     /** 求值为字符串列表；空串结果被丢弃 */
     fun evalToStrings(node: RuleNode, ctx: EvalContext): List<String> = when (node) {
-        is RuleNode.Legado -> {
+        is RuleNode.Legado -> regexGroupRule(node.rule, ctx) ?: run {
             val resolved = withGetVars(node.rule, ctx)
             // `@get:{n}` 整段就是取值（init 里 @put 之后的 name/author 常这么写）。
             // 代入后再当选择器会去找名为「魔道修真」的标签，必然空。
@@ -331,13 +344,17 @@ class RuleEvaluator(
                 if (resolved.isEmpty()) emptyList() else listOf(resolved)
             } else {
                 bareJsonPath(node.rule, ctx)?.let { path ->
-                    LegadoRuleAnalyzer.analyzeAsJson(node.rule)?.let { evalToStrings(it, ctx) } ?: jsonToStrings(readJsonPath(path, ctx))
+                    expandInnerJson(node.rule, ctx)?.let { listOf(it) }
+                        ?: LegadoRuleAnalyzer.analyzeAsJson(node.rule)?.let { evalToStrings(it, ctx) }
+                        ?: jsonToStrings(readJsonPath(path, ctx))
                 }
+                    ?: implicitXPath(node.rule, ctx)?.let { xpathStrings(resolved, ctx) }
                     ?: ctx.element?.let { LegadoSelector.strings(it, resolved) }.orEmpty()
             }
         }
         is RuleNode.XPath -> xpathStrings(node.path, ctx)
-        is RuleNode.JsonPath -> jsonToStrings(readJsonPath(node.path, ctx))
+        is RuleNode.JsonPath -> expandInnerJson(node.path, ctx)?.let { listOf(it) }
+            ?: jsonToStrings(readJsonPath(node.path, ctx))
         is RuleNode.RegexRule -> regexExtract(node.pattern, ctx)
         is RuleNode.Literal ->
             expandTemplate(node.template, ctx).let { if (it.isEmpty()) emptyList() else listOf(it) }
@@ -353,6 +370,56 @@ class RuleEvaluator(
             node.ops.fold(evalToStrings(node.source, ctx)) { acc, op -> applyOp(op, acc, ctx) }
                 .filter { it.isNotEmpty() }
     }
+
+    /**
+     * JSON 内容上的单花括号内嵌规则 `{$.x}`：`/books?bookId={$.bookId}`、
+     * `https://…/{$.bookId}_{$.chapterId}.txt?md5={$.content_md5}`、`@json:{$.classname}`。
+     * 同 Legado 的 AnalyzeByJSonPath.getString：先把每处 `{$.…}` 换成它的值，值为空的那处原样留着；
+     * 一处都没换成功返回 null，调用方再把整条规则当 JSONPath 读。
+     *
+     * 从前只认双花括号 `{{$.x}}`：这种写法被当成 Jsoup 选择器拿去选 JSON，书的地址、章节地址全空 ——
+     * 悦读、红薯、米读看书这几个接口源一本书都搜不到、目录一章都没有。只在 JSON 上下文里展开，同 Legado（HTML 页面上不认）。
+     */
+    private fun expandInnerJson(rule: String, ctx: EvalContext): String? {
+        var at = rule.indexOf("{$.")
+        if (at < 0) return null
+        val out = StringBuilder()
+        var from = 0
+        while (at >= 0) {
+            val close = closingBrace(rule, at)
+            if (close < 0) break
+            val value = nestedJsonRule(rule.substring(at + 1, close), ctx)
+            if (value.isNotEmpty()) {
+                out.append(rule, from, at).append(value)
+                from = close + 1
+            }
+            at = rule.indexOf("{$.", if (value.isNotEmpty()) from else at + 3)
+        }
+        if (from == 0) return null
+        return out.append(rule, from, rule.length).toString()
+    }
+
+    /** 从 `{`（下标 open）起按花括号配对找到匹配的 `}`；JSONPath 过滤器里的 `{…}` 一并计入。找不到返回 -1 */
+    private fun closingBrace(s: String, open: Int): Int {
+        var depth = 0
+        for (i in open until s.length) {
+            when (s[i]) {
+                '{' -> depth++
+                '}' -> if (--depth == 0) return i
+            }
+        }
+        return -1
+    }
+
+    /**
+     * 不带前缀、以单个 `/` 开头的规则是 XPath（`/a/p[1]/text()`、`/a/@href`，相对当前条目），同 Legado 的判定顺序：
+     * 内容是 JSON 的先走 JSONPath（[bareJsonPath] 在前面），其次 `/` 开头的走 XPath，剩下的才是 Jsoup。
+     * `//` 开头的分析阶段就认成了 [RuleNode.XPath]，到不了这里。
+     *
+     * 从前只认 `//`：单斜杠的整条交给 Jsoup，选择器没有以 `/` 开头的写法，一律空 —— 飘天文学搜到十本、书名书链全空。
+     */
+    private fun implicitXPath(rule: String, ctx: EvalContext): String? =
+        rule.takeIf { ctx.element != null && it.startsWith("/") }
 
     /**
      * 模板里的 JSONPath 规则（`{{$.recommend_count||$.booknum}}`、`{{$.tags[*]##\n##•}}`）：照 Legado 的 getString
@@ -503,6 +570,32 @@ class RuleEvaluator(
 
     // ---- regex ----
 
+    /**
+     * 列表规则是整体正则（`:href="(/book/[^"]+)"[^>]*>([^<]+)`，阅读的 AllInOne）：每个匹配一项，**全部分组**都留着，
+     * 字段规则用 `$1` `$2` 取（[regexGroupRule]）。从前每项只留第 1 组的文字，`$2` 一律取空 ——
+     * 爱丽丝书屋、978 小说的目录有上千项，书名全是空的，一章都没有。
+     */
+    private fun regexMatches(pattern: String, ctx: EvalContext): List<List<String>> {
+        val target = contextText(ctx)
+        if (target.isEmpty()) return emptyList()
+        val regex = runCatching { regexOf(pattern) }.getOrElse { return emptyList() }
+        return withRegexBudget(pattern, emptyList()) {
+            regex.findAll(guarded(target)).map { it.groupValues }.toList()
+        }
+    }
+
+    /**
+     * 整体正则列表里的一项（[regexMatches]）上，带 `$1` `$2`（一到两位数字）的字段规则：同阅读的 makeUpRule，
+     * 每处换成那一组的文字，其余照抄 —— `$2$3`、`https://…/content/$1`、`$5,$7,$10`。没有那一组的换成空。
+     * 当前项不是正则分组、规则里也没有 `$n` 的返回 null，照常求值。
+     */
+    private fun regexGroupRule(rule: String, ctx: EvalContext): List<String>? {
+        val groups = (ctx.json as? RegexGroups)?.values ?: return null
+        if (!GROUP_REF.containsMatchIn(rule)) return null
+        val filled = GROUP_REF.replace(rule) { m -> groups.getOrNull(m.groupValues[1].toInt()).orEmpty() }
+        return if (filled.isEmpty()) emptyList() else listOf(filled)
+    }
+
     private fun regexExtract(pattern: String, ctx: EvalContext): List<String> {
         val target = contextText(ctx)
         if (target.isEmpty()) return emptyList()
@@ -540,7 +633,7 @@ class RuleEvaluator(
      * 与 Legado 的 analyzeJs 一致：多段 js 依次求值，上一段的结果作为下一段的 `result` 输入。
      * 返回 null 表示这条地址不含 JS。
      */
-    fun evalUrlJs(url: String, ctx: EvalContext): String? {
+    fun evalUrlJs(url: String, ctx: EvalContext, onKey: ((String) -> Unit)? = null): String? {
         // 入口判据用 contains("@js:") 而非仅 trimStart().startsWith：`头@js:脚本` 的中缀写法
         // （如 `https://a.com/s@js:result+'&p=1'`）同样是 JS 地址，Legado 里 @js: 可出现在任意位置。
         if (!url.contains("<js>", ignoreCase = true) && !url.contains("@js:", ignoreCase = true)) {
@@ -560,8 +653,10 @@ class RuleEvaluator(
                 if (head.isNotEmpty()) result = head.replace("@result", result)
             }
             val script = m.groupValues[1].ifEmpty { m.groupValues[2] }
-            result = runJs(script, ctx, result)
-                ?: throw SourceException("地址脚本执行失败")
+            val evaluated = if (onKey == null) runJs(script, ctx, result) else runScript(ctx, result) { runtime, bindings ->
+                runtime.evalSearchUrl(script, bindings, ctx.js.jsLib, onKey)
+            }
+            result = evaluated ?: throw SourceException("地址脚本执行失败")
             start = m.range.last + 1
         }
         if (!found) return null
@@ -623,7 +718,8 @@ class RuleEvaluator(
             if (pipe == "encode" || pipe.startsWith("encode:")) {
                 val v = varValue(name, ctx)
                 val cs = if (pipe == "encode") Charsets.UTF_8 else charsetOf(pipe.removePrefix("encode:"))
-                return URLEncoder.encode(v, cs.name())
+                // 空格写成 %20：查询串、路径、表单里都是空格；`+` 在表单体里还会被发送前的按字段编码当成没编码的字再转一遍
+                return URLEncoder.encode(v, cs.name()).replace("+", "%20")
             }
         }
         // 嵌套规则（Legado：@ / $. / $[ / // 开头）
@@ -790,13 +886,106 @@ class RuleEvaluator(
      * 来源级的脚本（源级 header 的 `@js:` / `<js>`）：同阅读的 BaseSource.evalJS，不在哪一页上跑，
      * 没有 `result`，脚本原样跑、不先展开 `{{}}`。没有 JS 引擎、脚本报错都返回 null，由调用方当「没有」处理
      */
-    fun evalSourceScript(script: String, ctx: EvalContext, input: Any = ""): String? {
-        if (scriptRuntime == null) {
-            if (ctx.js.strictScripts) throw UnsupportedRuleException("当前未提供来源登录脚本引擎")
-            return null
-        }
-        return runJs(script, ctx, input = input)
+    fun evalSourceScript(script: String, ctx: EvalContext): String? {
+        if (scriptRuntime == null) return null
+        return runJs(script, ctx, input = "")
     }
+
+    internal fun loginForm(source: BookSourceRule, ctx: EvalContext): SourceLoginForm {
+        val json = source.loginUi?.trim().orEmpty()
+        val dynamic = headerScriptOf(json)
+        val fields = when {
+            dynamic != null -> parseSourceLoginFields(
+                evalLoginScript(source, ctx, dynamic, emptyMap()) ?: "[]",
+            )
+            json.isBlank() -> emptyList()
+            else -> parseSourceLoginFields(json)
+        }
+        val stored = loginValues(sourceBridge(ctx).getLoginInfo())
+        val values = fields.filterNot { it.isButton || it.isLabel }.associate { field ->
+            field.name to (stored[field.name] ?: field.defaultValue)
+        }
+        return SourceLoginForm(fields, values, source.loginScript != null)
+    }
+
+    internal fun runLogin(
+        source: BookSourceRule,
+        ctx: EvalContext,
+        values: Map<String, String>,
+        action: String?,
+        interaction: SourceLoginInteraction? = null,
+    ) = synchronized(loginLocks.computeIfAbsent(source.id) { Any() }) {
+        // 同一个来源的登录一个一个来：会话过期时几路抓取的校验脚本同时 source.login()，别同时写会话。
+        // 只锁登录本身：校验脚本、网页登录（等人操作）都不在锁里，免得这个来源的抓取全排在后面
+        val changes = mutableMapOf<SourceSessionKey, String?>()
+        evalLoginScript(source, ctx, action ?: "login.call(this)", values, interaction, changes)
+        com.radium.inkwell.core.source.js.EngineJsHttp.currentJob()?.ensureActive()
+        if (action == null && values.isNotEmpty() && SourceSessionKey.INFO !in changes) {
+            changes[SourceSessionKey.INFO] = Json.encodeToString(values)
+        }
+        // 登录脚本有时先写表单、再发登录请求。脚本失败时保留原有会话。
+        val sessionId = ctx.js.loginSessionId
+        if (sessionStore != null && sessionId != null) {
+            sessionStore.writeAll(sessionId, changes)
+        } else {
+            val bridge = sourceBridge(ctx)
+            for ((key, value) in changes) {
+                when (key) {
+                    SourceSessionKey.INFO -> bridge.putLoginInfo(value)
+                    SourceSessionKey.HEADERS -> bridge.putLoginHeader(value)
+                    SourceSessionKey.VARIABLE -> bridge.setVariable(value)
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    private fun evalLoginScript(
+        source: BookSourceRule,
+        ctx: EvalContext,
+        action: String,
+        values: Map<String, String>,
+        interaction: SourceLoginInteraction? = null,
+        changes: MutableMap<SourceSessionKey, String?>? = null,
+    ): String? {
+        val formJson = Json.encodeToString(values)
+        return runScript(
+            ctx, ScriptJson(formJson, asLoginForm = true), strict = true, interaction = interaction,
+            submittedInfo = formJson.takeIf { values.isNotEmpty() },
+            pendingLogin = changes,
+        ) { runtime, bindings ->
+            runtime.eval(listOfNotNull(source.loginScript, action).joinToString("\n"), bindings, ctx.js.jsLib)
+        }
+    }
+
+    internal fun checkLogin(
+        source: BookSourceRule,
+        ctx: EvalContext,
+        response: StrResponse,
+        script: String,
+        retry: () -> StrResponse,
+    ): StrResponse? = runScript(
+        ctx, response, strict = true, loginRetry = retry,
+        loginAction = { runLogin(source, ctx, loginValues(sourceBridge(ctx).getLoginInfo()), action = null) },
+    ) { runtime, bindings -> runtime.evalForResponse(script, bindings, ctx.js.jsLib) }
+
+    private fun sourceBridge(
+        ctx: EvalContext,
+        loginAction: (() -> Unit)? = null,
+        submittedInfo: String? = null,
+        pendingLogin: MutableMap<SourceSessionKey, String?>? = null,
+    ): SourceBridge =
+        SourceBridge(
+            ctx.js.sourceKey,
+            sourceStores.getOrPut(ctx.js.sourceKey to ctx.js.loginSessionId) { ConcurrentHashMap() },
+            ctx.js.sourceFacts,
+            sessionStore,
+            loginAction,
+            submittedInfo,
+            pendingLogin,
+            ctx.js.loginSessionId,
+            observeLoginHeaders = { (jsHttp as? EngineJsHttp)?.rememberLoginHeaders(it) },
+        )
 
     /**
      * 绑定书源脚本可见的全部上下文：变量（result/src/baseUrl/key/page）+ 桥对象
@@ -809,7 +998,16 @@ class RuleEvaluator(
      * 它只在 AnalyzeUrl 里绑这两个，规则脚本里没有。从前处处都绑，光遇聚合的列表脚本 `const {key, tab, page} = res`
      * 撞上已有的同名变量，Rhino 报「变量 page 被重新声明」，整个搜索一本都没有。
      * [input] 是脚本的 `result`：多数时候是文字；是 JSON、脚本又读它的字段时是 ScriptJson（[scriptInput]）；
-     * 元素列表接脚本时是那组元素（[wholeElementPipe]），这时 `src` 给整页原文
+     * 元素列表接脚本时是那组元素（[wholeElementPipe]）。
+     *
+     * `src` 同 Legado 是**这一次求值的内容本身**（`bindings["src"] = content`）：页面一级是整页原文，列表里是那一条
+     * （元素给 outerHtml、JSON 给 JSON 文本），和 `result`（上一步的结果）无关。从前文字结果直接当 `src`：
+     * `@href<js>…String(src).match(…)</js>` 拿到的是链接本身，不是那一条目录项 —— 废纸文学这一类站把真地址
+     * base64 藏在目录项的属性里，章节地址全空；`text.下一页@text @js:src.match(…)` 要的是整页，拿到的是「下一页」三个字。
+     * 拼地址的脚本（`inUrl`：没有页面）照旧给 `result`，Legado 在那里根本不绑 src。
+     * 算 src 要序列化一遍当前内容（列表里每一项一次 outerHtml），所以是**读到才算**（[LazyBinding]）。
+     * 不按「脚本里有没有 src 这几个字」判断：公用函数常常是运行时才 eval 进来的（`eval(String(source.loginUrl))`、
+     * `eval(java.ajax(库地址))`），扫脚本原文看不见，函数里读 src 拿到的就成了空串。
      */
     private fun runJs(script: String, ctx: EvalContext, input: Any): String? =
         runScript(ctx, input) { runtime, bindings -> runtime.eval(script, bindings, ctx.js.jsLib) }
@@ -817,28 +1015,36 @@ class RuleEvaluator(
     private inline fun <T : Any> runScript(
         ctx: EvalContext,
         input: Any,
+        strict: Boolean = false,
+        interaction: SourceLoginInteraction? = null,
+        noinline loginAction: (() -> Unit)? = null,
+        noinline loginRetry: (() -> StrResponse)? = null,
+        submittedInfo: String? = null,
+        pendingLogin: MutableMap<SourceSessionKey, String?>? = null,
         run: (com.radium.inkwell.core.source.js.ScriptRuntime, Map<String, Any?>) -> T?,
     ): T? {
         val runtime = scriptRuntime
             ?: throw UnsupportedRuleException("该来源需要 JS 引擎，当前版本不支持")
-        val store = sourceStores.getOrPut(ctx.js.sourceKey) { ConcurrentHashMap() }
-        val loginSession = com.radium.inkwell.core.source.auth.SourceRequestSession.current()?.takeIf { ctx.js.interaction != null }
-        val boundHttp = if (loginSession != null && jsHttp != null) com.radium.inkwell.core.source.js.SessionBoundJsHttp(jsHttp, loginSession, (jsHttp as? com.radium.inkwell.core.source.js.EngineJsHttp)?.bindingTo(com.radium.inkwell.core.source.js.EngineJsHttp.currentJob()) ?: kotlin.coroutines.EmptyCoroutineContext) else jsHttp
+        val cache = ctx.js.loginSessionId?.let { id ->
+            loginCaches.computeIfAbsent(id) { com.radium.inkwell.core.source.js.JsCache() }
+        } ?: jsCache
         val java = com.radium.inkwell.core.source.js.JavaBridge(
-            boundHttp, jsCache, ctx.js.scriptVars, query = ruleQuery(ctx), chinese = runtime.chineseConverter,
-            deviceId = { runtime.androidId }, interaction = ctx.js.interaction,
+            jsHttp, cache, ctx.js.scriptVars, query = ruleQuery(ctx), chinese = runtime.chineseConverter,
+            deviceId = { runtime.androidId }, loginInteraction = interaction, loginRetry = loginRetry,
         )
         return try {
             val inUrl = ctx.json == null && ctx.element == null
             run(
                 runtime,
                 buildMap {
+                    ctx.js.loginSessionId?.let { put(LOGIN_SCOPE_BINDING, it) }
                     put("result", input)
                     put(
                         "src",
-                        when (input) {
-                            is String -> input
-                            is com.radium.inkwell.core.source.js.ScriptJson -> input.text
+                        when {
+                            !inUrl -> com.radium.inkwell.core.source.js.LazyBinding { contextText(ctx) }
+                            input is String -> input
+                            input is com.radium.inkwell.core.source.js.ScriptJson -> input.text
                             else -> contextText(ctx)
                         },
                     )
@@ -849,9 +1055,9 @@ class RuleEvaluator(
                     }
                     put("title", ctx.js.chapter.title)
                     put("java", java)
-                    put("cookie", com.radium.inkwell.core.source.js.CookieBridge(boundHttp))
-                    put("cache", jsCache)
-                    put("source", com.radium.inkwell.core.source.js.SourceBridge(ctx.js.sourceKey, store, ctx.js.sourceFacts, loginSession))
+                    put("cookie", com.radium.inkwell.core.source.js.CookieBridge(jsHttp))
+                    put("cache", cache)
+                    put("source", sourceBridge(ctx, loginAction, submittedInfo, pendingLogin))
                     put("book", ctx.js.book)
                     put("chapter", ctx.js.chapter)
                 },
@@ -859,19 +1065,18 @@ class RuleEvaluator(
         } catch (e: Exception) {
             // 取消不是「脚本报错」：吞掉的话，被取消的那次调用还会带着空结果把剩下的条目一个个求值完
             if (e is kotlinx.coroutines.CancellationException) throw e
-            if (ctx.js.strictScripts) throw SourceException("来源登录脚本执行失败，可能使用了尚未支持的能力")
+            if (strict) throw SourceLoginException(SourceLoginDiagnostic.SCRIPT_FAILED)
             null
         }
     }
 
     /**
      * 来源脚本 `source.putLoginHeader(…)` 存下的请求头（同 Legado：之后这个来源的每个请求都带上）。
-     * 只在进程内：不做登录界面，脚本自己算出来的 Cookie / token（一读这类站先过一道脚本挑战）照样接得上。
      * 没存过、存的不是 JSON 对象为空
      */
-    fun loginHeaders(sourceKey: String): Map<String, String> =
-        (if (com.radium.inkwell.core.source.auth.SourceRequestSession.current() != null) null
-            else sourceStores[sourceKey])?.get(com.radium.inkwell.core.source.js.SourceBridge.LOGIN_HEADER)
+    fun loginHeaders(sourceKey: String, sessionId: String? = null): Map<String, String> =
+        (if (sessionId != null && sessionStore != null) sessionStore.read(sessionId, SourceSessionKey.HEADERS)
+        else sourceStores[sourceKey to sessionId]?.get(SourceBridge.LOGIN_HEADER))
             ?.let { parseHeaderJson(it) }
             .orEmpty()
 
@@ -883,9 +1088,6 @@ class RuleEvaluator(
         override fun getStringList(rule: String): Array<String> =
             runCatching { evalToStrings(LegadoRuleAnalyzer.analyze(rule), ctx).toTypedArray() }
                 .getOrDefault(emptyArray())
-
-        override fun getElement(rule: String): com.radium.inkwell.core.source.js.JsElement? =
-            getElements(rule).first()
 
         override fun getElements(rule: String): com.radium.inkwell.core.source.js.JsElements =
             com.radium.inkwell.core.source.js.JsElements(
@@ -1153,6 +1355,18 @@ private val STRING_MEMBERS = setOf(
 
 /** 一段 HTML 开头的标签名（`<tr class=…>` → tr），见 RuleEvaluator.htmlFragment */
 private val FIRST_TAG = Regex("^<([a-zA-Z][a-zA-Z0-9]*)")
+
+/** 字段规则里的正则分组引用 `$1`、`$10`（同阅读的 `\$\d{1,2}`），见 RuleEvaluator.regexGroupRule */
+private val GROUP_REF = Regex("\\$(\\d{1,2})")
+
+/**
+ * 整体正则列表里的一项：一次匹配的全部分组（[0] 是整个匹配），见 RuleEvaluator.regexMatches。
+ * 包一层是为了和 JSON 数组的条目分开：只有它上面的 `$n` 是分组引用。
+ * 当文字用（脚本的 result、再套一层 `:正则`）时是第 1 组（没有分组时是整个匹配）—— 从前每项就是这个，不用 `$n` 的写法照旧
+ */
+internal class RegexGroups(val values: List<String>) {
+    override fun toString(): String = values.getOrNull(1) ?: values.firstOrNull().orEmpty()
+}
 
 /** 字符集解析；GBK/GB2312 一律按 GB18030 处理 */
 internal fun charsetOf(name: String): Charset = when (name.trim().lowercase()) {

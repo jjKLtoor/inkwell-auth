@@ -1,6 +1,12 @@
 package com.radium.inkwell.core.source
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -9,6 +15,8 @@ import org.junit.After
 import org.junit.Before
 import java.io.IOException
 import java.net.SocketException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -34,23 +42,33 @@ class SourceHttpClientTest {
     private fun client() =
         SourceHttpClient(OkHttpClient(), retryBaseDelayMs = 1, allowPrivateNetwork = true)
 
+    @Test
+    fun `only searches to the warming origin wait and a failed warmup releases them`() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        val transport = OkHttpClient.Builder().addInterceptor {
+            started.complete(Unit)
+            release.await(3, TimeUnit.SECONDS)
+            throw IOException("warmup unavailable")
+        }.build()
+        val http = SourceHttpClient(transport)
+        val warm = launch { http.warmSearchConnection("https://one.example/".toHttpUrl()) }
+        try {
+            withTimeout(3_000) { started.await() }
+            val same = async { http.awaitSearchConnection("https://one.example/search?q=book") }
+            yield()
+            withTimeout(300) { http.awaitSearchConnection("https://two.example/search") }
+            assertTrue(!same.isCompleted)
+            release.countDown()
+            withTimeout(500) { same.await() }
+        } finally {
+            release.countDown()
+            warm.join()
+        }
+    }
+
     private fun gbkBody(html: String): Buffer =
         Buffer().write(html.toByteArray(charset("GBK")))
-
-    @Test
-    fun `browser owned cookies are not overwritten or replayed by proxy cache`() = runBlocking {
-        val proxy = SourceHttpClient(allowPrivateNetwork = true, useMemoryCookieJar = false)
-        server.enqueue(MockResponse().addHeader("Set-Cookie", "sid=server-old; Path=/").setBody("first"))
-        server.enqueue(MockResponse().setBody("second"))
-        server.enqueue(MockResponse().setBody("anonymous"))
-        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to "sid=browser-before"))
-        // 模拟页面执行脚本后更新 Cookie，网络层必须原样使用 profile 的最新结果。
-        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to "sid=browser-updated; script=yes"))
-        proxy.fetch(server.url("/").toString(), headers = mapOf("Cookie" to ""))
-        assertEquals("sid=browser-before", server.takeRequest().getHeader("Cookie"))
-        assertEquals("sid=browser-updated; script=yes", server.takeRequest().getHeader("Cookie"))
-        assertEquals("", server.takeRequest().getHeader("Cookie"))
-    }
 
     @Test
     fun `charset from content type header, gbk decoded as gb18030`() = runBlocking {

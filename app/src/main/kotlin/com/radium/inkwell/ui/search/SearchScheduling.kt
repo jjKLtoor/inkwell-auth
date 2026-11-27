@@ -1,7 +1,9 @@
 package com.radium.inkwell.ui.search
 
+import com.radium.inkwell.data.db.entity.BookEntity
+import com.radium.inkwell.data.db.entity.BookType
 import com.radium.inkwell.data.db.entity.CheckStatus
-import com.radium.inkwell.data.prefs.SourceSearchPriority
+import com.radium.inkwell.data.prefs.SearchPriorityPreferences
 import com.radium.inkwell.data.repo.BookSourceRepository.EnabledSource
 import com.radium.inkwell.data.repo.TitleMatch
 import kotlin.math.abs
@@ -38,6 +40,30 @@ internal sealed interface SearchOutcome {
  */
 internal object SearchScheduling {
 
+    fun prioritizedIds(settings: SearchPriorityPreferences, keyword: String, books: List<BookEntity>): Set<String> {
+        if (!settings.enabled) return emptySet()
+        val title = normalizeSearchMatch(keyword)
+        return settings.sourceIds + books.asSequence()
+            // 搜索页未解锁隐藏区，不应通过优先顺序暴露其中的书。
+            .filter { it.id in settings.bookIds && it.type == BookType.NET && it.inShelf && !it.deleted && !it.hidden && !it.removedFromShelf }
+            .filter { normalizeSearchMatch(it.title) == title }
+            .mapNotNull { it.sourceId }
+            .toSet()
+    }
+
+    fun <T> phases(items: List<T>, prioritized: (T) -> Boolean): List<List<T>> {
+        val (first, rest) = items.partition(prioritized)
+        return listOf(first, rest).filter { it.isNotEmpty() }
+    }
+
+    /** 两阶段共用原并发上限。优先请求全部结束后，普通队列才获得调用机会。 */
+    suspend fun <T> runPhases(items: List<T>, prioritized: (T) -> Boolean, search: suspend (T) -> Unit) = coroutineScope {
+        val limiter = Semaphore(CONCURRENCY)
+        for (phase in phases(items, prioritized)) {
+            phase.map { item -> async { limiter.withPermit { search(item) } } }.awaitAll()
+        }
+    }
+
     /** 连续失败这么多次就排到最后。不剔除：站点抽风过后会恢复，搜成功一次就清零回到正常位置 */
     const val DEMOTE_AFTER_FAILS = 2
 
@@ -66,19 +92,6 @@ internal object SearchScheduling {
 
     /** 书源总共就这么几个时不提前结束：省不了多少时间，反倒让人以为没搜完 */
     const val EARLY_STOP_MIN_SOURCES = 20
-
-    fun <T> priorityGroups(sources: List<T>, priority: (T) -> SourceSearchPriority): List<List<T>> {
-        val groups = sources.groupBy(priority)
-        return SourceSearchPriority.entries.asReversed().mapNotNull(groups::get)
-    }
-
-    /** 前一档全部收尾才向下一档发请求；档内依旧按原队列并发。 */
-    suspend fun <T> runRound(sources: List<T>, priority: (T) -> SourceSearchPriority, search: suspend (T) -> Unit) = coroutineScope {
-        val limiter = Semaphore(CONCURRENCY)
-        for (group in priorityGroups(sources, priority)) {
-            group.map { source -> async { limiter.withPermit { search(source) } } }.awaitAll()
-        }
-    }
 
     /** 排队顺序：没被降级的在前；同档按估计耗时从快到慢；再同则保持书源管理里的手动顺序（稳定排序） */
     fun order(sources: List<EnabledSource>, now: Long = System.currentTimeMillis()): List<EnabledSource> {
