@@ -1,21 +1,26 @@
 package com.radium.inkwell.core.source
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlin.coroutines.resumeWithException
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Connection
+import okhttp3.EventListener
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -84,6 +89,8 @@ class FetchedPage(
     val detectedCharset: String,
     /** 响应头（同名多值保留）；脚本里的 `StrResponse.headers(name)` 靠它 */
     val headers: Map<String, List<String>> = emptyMap(),
+    /** HTTP 跳转链最后一次实际发出的方法；合成响应不提供此值。 */
+    val requestMethod: String? = null,
 )
 
 /**
@@ -126,12 +133,20 @@ class SourceHttpClient(
                 }.build()
             }
             val web = scope?.sessionId?.let { webCookies(it, request.url) }
+            val loginUa = scope?.sessionId?.let { sessionStore.webLoginUserAgent(it, request.url) }
+                ?.takeIf { it.isNotBlank() && isValidHeaderValue(it) }
             // 网页 Cookie 每跳按实际地址重新取，跟随重定向时由目标站的 origin 决定。
-            val cookies = if (web.isNullOrBlank()) null else mergeWebCookies(request.header("Cookie").orEmpty(), web)
-            chain.proceed(
-                if (cookies == null || !isValidHeaderValue(cookies)) request
-                else request.newBuilder().header("Cookie", cookies).build(),
-            )
+            val cookies = web?.takeIf(String::isNotBlank)
+                ?.let { mergeWebCookies(request.header("Cookie").orEmpty(), it) }
+                ?.takeIf(::isValidHeaderValue)
+            if (cookies != null || loginUa != null) {
+                request = request.newBuilder().apply {
+                    if (cookies != null) header("Cookie", cookies)
+                    // UA 也是网页会话的一部分。每跳独立匹配 origin，跨站后仍用来源原有的 UA。
+                    if (loginUa != null) header("User-Agent", loginUa)
+                }.build()
+            }
+            chain.proceed(request)
         }
         // 超时必须显式配：OkHttp 默认 connect/read/write 各 10 秒，且**没有 callTimeout**。
         // 没有总闸的话，一个每 9 秒吐一个字节的站能把这次调用无限期挂住 —— 而书源脚本那条路
@@ -149,6 +164,43 @@ class SourceHttpClient(
     }
 
     private val sharedSession = SessionClient(client, cookieJar)
+    private class WarmConnection(val origin: HttpUrl, val ready: CompletableDeferred<Unit> = CompletableDeferred())
+    @Volatile private var warming: WarmConnection? = null
+    private val warmupClient by lazy {
+        client.newBuilder().cookieJar(CookieJar.NO_COOKIES)
+            .followRedirects(false).retryOnConnectionFailure(false)
+            .callTimeout(4.seconds.toJavaDuration()).build()
+    }
+
+    /** 与搜索共用连接池。只向站点根路径发匿名 HEAD，不运行规则、提交搜索或接收登录 Cookie。 */
+    internal suspend fun warmSearchConnection(url: HttpUrl) {
+        if (!url.isHttps || isPrivateNetworkLiteral(url.host)) return
+        val pending = WarmConnection(url.sourceOrigin())
+        val call = warmupClient.newCall(Request.Builder().url(pending.origin).head().build())
+        call.addEventListener(object : EventListener() {
+            override fun connectionAcquired(call: Call, connection: Connection) {
+                // HTTP/2 可同时发搜索和 HEAD；HTTP/1 要等 HEAD 归还连接。
+                if (connection.protocol() == Protocol.HTTP_2) pending.ready.complete(Unit)
+            }
+        })
+        warming = pending
+        try {
+            execute(call).close()
+        } catch (_: IOException) {
+            // 搜索仍按原路径独立发起。
+        } finally {
+            warming = null
+            pending.ready.complete(Unit)
+        }
+    }
+
+    internal suspend fun awaitSearchConnection(url: String) {
+        val pending = warming ?: return
+        if (url.toHttpUrlOrNull()?.sourceOrigin() == pending.origin) {
+            // 已在握手时给它短暂的先机；失效的预连接不能拖到四秒总超时。
+            withTimeoutOrNull(1_000) { pending.ready.await() }
+        }
+    }
     private val sourceSessions = ConcurrentHashMap<String, SessionClient>()
 
     private fun clientSession(sourceId: String?): SessionClient = if (sourceId == null) sharedSession else {
@@ -178,12 +230,16 @@ class SourceHttpClient(
         }
 
     /** 书源脚本要读写 cookie（登录态、防盗链 token 都靠它） */
-    fun cookieOf(url: String, sourceId: String? = null): String = url.toHttpUrlOrNull()
+    fun cookieOf(url: String, sourceId: String? = null): String = cookieUrl(url)
         ?.let { target ->
             val local = nativeCookies(sourceId, target)
             val web = sourceId?.let { webCookies(it, target) }
             if (web.isNullOrBlank()) local else mergeWebCookies(local, web)
         }.orEmpty()
+
+    /** 阅读脚本的 Cookie 接口也接受纯域名，例如网页登录后传入站点域名取会话。 */
+    private fun cookieUrl(value: String): HttpUrl? = value.toHttpUrlOrNull()
+        ?: runCatching { HttpUrl.Builder().scheme("https").host(value).build() }.getOrNull()
 
     private fun nativeCookies(sessionId: String?, target: HttpUrl): String =
         clientSession(sessionId).jar.loadForRequest(target).joinToString("; ") { "${it.name}=${it.value}" }
@@ -198,7 +254,7 @@ class SourceHttpClient(
     private data class SourceRequest(val sessionId: String?, val origin: HttpUrl, val credentialHeaders: Set<String>)
 
     fun setCookie(url: String, cookie: String, sourceId: String? = null) {
-        val u = url.toHttpUrlOrNull() ?: return
+        val u = cookieUrl(url) ?: return
         // 脚本写的同阅读的 CookieStore.setCookie，存下来、重启后还在：登录脚本常这样存登录态。没写过期时间的在 OkHttp 里
         // 是会话 Cookie、不落盘（见 clientSession），补一个远期的。服务端下发的会话 Cookie 不动，同阅读只留在这一次运行里
         val cookies = cookie.split(';').mapNotNull { Cookie.parse(u, it.trim()) }
@@ -207,7 +263,7 @@ class SourceHttpClient(
     }
 
     fun removeCookie(url: String, sourceId: String? = null) {
-        val target = url.toHttpUrlOrNull() ?: return
+        val target = cookieUrl(url) ?: return
         clientSession(sourceId).jar.clear(target)
         if (sourceId != null) clearWebCookies(sourceId, target)
     }
@@ -291,6 +347,7 @@ class SourceHttpClient(
                     bodyText = String(bytes, charset),
                     detectedCharset = charset.name(),
                     headers = resp.headers.toMultimap(),
+                    requestMethod = resp.request.method,
                 )
             }
         }

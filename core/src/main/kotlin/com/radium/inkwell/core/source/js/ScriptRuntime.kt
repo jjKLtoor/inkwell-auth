@@ -27,6 +27,14 @@ interface ScriptRuntime {
      */
     fun eval(script: String, bindings: Map<String, Any?>, jsLib: String? = null): String?
 
+    /** 搜索地址脚本可能重写 key，例如从「书名@子源」里提取书名。 */
+    fun evalSearchUrl(
+        script: String,
+        bindings: Map<String, Any?>,
+        jsLib: String?,
+        onKey: (String) -> Unit,
+    ): String? = eval(script, bindings, jsLib)
+
     /**
      * 同 [eval]，给列表规则（bookList / chapterList）用：脚本交回的是 Jsoup 替身的元素（`doc.select('tr#nr')`、
      * `java.getElements(…)`）时交回元素本身，同 Legado 的 getElements 直接拿脚本返回的 Elements 当列表。
@@ -58,7 +66,7 @@ interface ScriptRuntime {
  * （Java 的 Map / List），来源照它写 `result.book_id`、`result.toArray()`；也有来源照字符串写 `JSON.parse(result)`、
  * `result.match(…)`。两种都得认，见 RhinoScriptRuntime.jsonValue
  */
-class ScriptJson(val text: String, val asObject: Boolean = false)
+class ScriptJson(val text: String, val asLoginForm: Boolean = false)
 
 /** [ScriptRuntime.evalForList] 的结果：元素，或同 [ScriptRuntime.eval] 的文本 */
 sealed interface ScriptValue {
@@ -205,6 +213,13 @@ class RhinoScriptRuntime(
     override fun eval(script: String, bindings: Map<String, Any?>, jsLib: String?): String? =
         (run(script, bindings, jsLib, keepNodes = false) as ScriptValue.Text).text
 
+    override fun evalSearchUrl(
+        script: String,
+        bindings: Map<String, Any?>,
+        jsLib: String?,
+        onKey: (String) -> Unit,
+    ): String? = (run(script, bindings, jsLib, keepNodes = false, onKey = onKey) as ScriptValue.Text).text
+
     override fun evalForList(script: String, bindings: Map<String, Any?>, jsLib: String?): ScriptValue =
         run(script, bindings, jsLib, keepNodes = true) as ScriptValue
 
@@ -217,6 +232,7 @@ class RhinoScriptRuntime(
         jsLib: String?,
         keepNodes: Boolean,
         keepResponse: Boolean = false,
+        onKey: ((String) -> Unit)? = null,
     ): Any {
         // 嵌套求值（脚本里 java.getString("@js:…") 又回到这里）进的是同一个 Context：只在最外层清零
         // 指令计数。每进一层都清零的话，`while(true){ java.getString("@js:1") }` 永远撞不到上限
@@ -279,6 +295,14 @@ class RhinoScriptRuntime(
                 val compiled = compiledScripts.get(script)
                     ?: compiledScripts.put(script, cx.compileString(script, "rule.js", 1, null))
                 val result = compiled.exec(cx, scope)
+                if (onKey != null) {
+                    // 有公共库时，脚本可以把更新后的值留在本次作用域上。
+                    val owner = if (scope.has("key", scope)) scope else holder
+                    val getter = (owner as ScriptableObject).getGetterOrSetter("key", 0, owner, false)
+                    val key = if (getter is org.mozilla.javascript.Callable) null
+                    else owner.get("key", owner) as? CharSequence
+                    if (key != null) onKey(key.toString())
+                }
                 if (keepNodes) elementsOf(result)?.let { return ScriptValue.Nodes(it) }
                 if (keepResponse) {
                     val response = (result as? org.mozilla.javascript.Wrapper)?.unwrap() as? StrResponse
@@ -315,7 +339,16 @@ class RhinoScriptRuntime(
             ScriptableObject.callMethod(cx, json, "parse", arrayOf<Any>(text))
         }.getOrNull()
         if (parsed !is NativeObject && parsed !is NativeArray) return text
-        if (value.asObject) return parsed
+        if (value.asLoginForm) {
+            if (parsed is NativeObject && !parsed.has("get", parsed)) {
+                parsed.defineProperty("get", ScriptFunction { args ->
+                    args.firstOrNull()?.let { key ->
+                        parsed.get(Context.toString(key), parsed).takeUnless { it == Scriptable.NOT_FOUND }
+                    }
+                }, ScriptableObject.DONTENUM)
+            }
+            return parsed
+        }
         val str = cx.newObject(scope, "String", arrayOf<Any>(text))
         if (parsed is NativeArray) {
             str.put("toArray", str, ScriptFunction { parsed })

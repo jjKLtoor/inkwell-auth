@@ -21,6 +21,8 @@ import androidx.core.os.BundleCompat
 import androidx.core.view.WindowCompat
 import com.radium.inkwell.data.prefs.AppPrefs
 import com.radium.inkwell.ui.nav.InkwellNavDisplay
+import com.radium.inkwell.ui.reader.ReaderWindowBrightness
+import com.radium.inkwell.ui.stats.ReadingWidgetProvider
 import com.radium.inkwell.ui.theme.InkwellTheme
 import com.radium.inkwell.ui.theme.rememberResolvedScheme
 import com.radium.inkwell.ui.theme.ThemeConfig
@@ -36,14 +38,17 @@ import org.koin.android.ext.android.inject
  */
 class MainActivity : androidx.fragment.app.FragmentActivity() {
 
+    internal val readerBrightness by lazy { ReaderWindowBrightness(this) }
     private val keyEventBus: KeyEventBus by inject()
     private val appPrefs: AppPrefs by inject()
     private val updateNotifier: UpdateNotifier by inject()
     private var externalBooks by mutableStateOf<List<Intent>>(emptyList())
+    private var openReadingStats by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        openReadingStats = savedInstanceState?.getBoolean(OPEN_STATS) ?: (intent.action == ReadingWidgetProvider.OPEN_READING_STATS)
         if (savedInstanceState == null) {
             receiveExternalBook(intent)
         } else {
@@ -84,6 +89,8 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
                 InkwellNavDisplay(
                     externalBook = externalBooks.firstOrNull(),
                     onExternalBookHandled = { request -> externalBooks = externalBooks.filterNot { it === request } },
+                    openReadingStats = openReadingStats,
+                    onReadingStatsOpened = { openReadingStats = false },
                 )
             }
         }
@@ -92,11 +99,13 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         receiveExternalBook(intent)
+        if (intent.action == ReadingWidgetProvider.OPEN_READING_STATS) openReadingStats = true
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putParcelableArrayList(EXTERNAL_BOOKS, ArrayList(externalBooks))
+        outState.putBoolean(OPEN_STATS, openReadingStats)
     }
 
     private fun receiveExternalBook(intent: Intent) {
@@ -133,6 +142,7 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
     private companion object {
         const val THEME_WAIT_MS = 300L
         const val EXTERNAL_BOOKS = "external_book_requests"
+        const val OPEN_STATS = "open_reading_stats"
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
